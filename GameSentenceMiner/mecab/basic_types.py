@@ -21,14 +21,22 @@ class MecabAnalysis(typing.NamedTuple):
     katakana_reading: str
     part_of_speech: str
     inflection_type: str
+    inflection_form: str
+    pos2: str
+    pos3: str
+    pos4: str
 
 
 COMPONENTS: typing.Final[MecabAnalysis] = MecabAnalysis(
     word="%m",
-    headword="%f[6]",
-    katakana_reading="%f[7]",
-    part_of_speech="%f[0]",
-    inflection_type="%f[5]",
+    headword="%f[6]",  # lemma/dictionary form (原形)
+    katakana_reading="%f[7]",  # reading (読み)
+    part_of_speech="%f[0]",  # pos1
+    inflection_type="%f[4]",  # conjugation type (活用型)
+    inflection_form="%f[5]",  # conjugation form (活用形)
+    pos2="%f[1]",
+    pos3="%f[2]",
+    pos4="%f[3]",
 )
 
 
@@ -111,9 +119,18 @@ class MecabParsedToken:
     katakana_reading: Optional[str]  # inflected reading
     part_of_speech: PartOfSpeech
     inflection_type: Inflection
+    inflection_type_raw: Optional[str]
+    inflection_form: Optional[str]
+    pos2: Optional[str]
+    pos3: Optional[str]
+    pos4: Optional[str]
 
 
-assert tuple(field.name for field in dataclasses.fields(MecabParsedToken)) == tuple(COMPONENTS.__annotations__)
+# Verify that the first 5 required fields align with MecabAnalysis format
+# (inflection_type_raw is an extra field not from MeCab output, for copula checks)
+_parsed_token_fields = tuple(field.name for field in dataclasses.fields(MecabParsedToken))
+assert _parsed_token_fields[:5] == MecabAnalysis._fields[:5], "Required fields must match"
+assert _parsed_token_fields[6:] == MecabAnalysis._fields[5:], "Optional fields must match"
 
 
 def main():
