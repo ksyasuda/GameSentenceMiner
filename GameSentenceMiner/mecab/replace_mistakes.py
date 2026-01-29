@@ -83,6 +83,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="シロ",
             part_of_speech=PartOfSpeech.verb,
             inflection_type=Inflection.imperative_ro,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="って",
@@ -90,6 +95,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ッテ",
             part_of_speech=PartOfSpeech.particle,
             inflection_type=Inflection.unknown,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "はおら" and token.headword == "はおる" and "ぬ" == take_headword(context, pos + 1):
         # Xはおらぬ
@@ -99,6 +109,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ハ",
             part_of_speech=PartOfSpeech.particle,
             inflection_type=Inflection.unknown,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="おら",
@@ -106,6 +121,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="オラ",
             part_of_speech=PartOfSpeech.verb,
             inflection_type=Inflection.irrealis,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "降り" and token.katakana_reading == "オリ" and "が" == take_headword(context, pos - 1):
         # 雪が降りました: オ=>フ
@@ -128,6 +148,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ハバタ",
             part_of_speech=PartOfSpeech.verb,
             inflection_type=Inflection.irrealis,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "阿良" and slice_headwords(context, pos + 1, pos + 3) == ("々", "木"):
         context[pos + 1].skip = True
@@ -138,6 +163,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="アララギ",
             part_of_speech=PartOfSpeech.noun,
             inflection_type=Inflection.dictionary_form,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "乗り" and slice_headwords(context, pos + 1, pos + 3) == ("込", "え"):
         context[pos + 1].skip = True
@@ -148,6 +178,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ノリコエ",
             part_of_speech=PartOfSpeech.verb,
             inflection_type=Inflection.continuative,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif (
         token.word == "助"
@@ -161,6 +196,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="タスカラ",
             part_of_speech=PartOfSpeech.verb,
             inflection_type=Inflection.irrealis,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "いい気" and take_headword(context, pos + 1) == "分":
         context[pos + 1].skip = True
@@ -170,6 +210,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="イイ",
             part_of_speech=PartOfSpeech.i_adjective,
             inflection_type=Inflection.dictionary_form,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="気分",
@@ -177,6 +222,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="キブン",
             part_of_speech=PartOfSpeech.noun,
             inflection_type=Inflection.dictionary_form,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "しや" and token.headword == "視野":
         yield dataclasses.replace(
@@ -192,6 +242,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="イイ",
             part_of_speech=PartOfSpeech.i_adjective,
             inflection_type=Inflection.dictionary_form,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="っ",
@@ -199,6 +254,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ッ",
             part_of_speech=PartOfSpeech.unknown,
             inflection_type=Inflection.unknown,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "本当のところ":
         yield MecabParsedToken(
@@ -207,6 +267,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ホントウ",
             part_of_speech=PartOfSpeech.noun,
             inflection_type=Inflection.dictionary_form,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="の",
@@ -214,6 +279,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ノ",
             part_of_speech=PartOfSpeech.particle,
             inflection_type=Inflection.unknown,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="ところ",
@@ -221,6 +291,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="トコロ",
             part_of_speech=PartOfSpeech.noun,
             inflection_type=Inflection.dictionary_form,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "有り難う" and token.katakana_reading == "アリガタウ":
         yield dataclasses.replace(token, katakana_reading="アリガトウ")
@@ -235,6 +310,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="デ",
             part_of_speech=PartOfSpeech.particle,
             inflection_type=Inflection.unknown,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="は",
@@ -242,6 +322,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ハ",
             part_of_speech=PartOfSpeech.particle,
             inflection_type=Inflection.unknown,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "いた目" and token.katakana_reading == "イタメ" and token.headword == "板目":
         yield MecabParsedToken(
@@ -250,6 +335,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="イ",
             part_of_speech=PartOfSpeech.verb,
             inflection_type=Inflection.continuative,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="た",
@@ -257,6 +347,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="タ",
             part_of_speech=PartOfSpeech.bound_auxiliary,
             inflection_type=Inflection.continuative,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="目",
@@ -264,6 +359,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="メ",
             part_of_speech=PartOfSpeech.noun,
             inflection_type=Inflection.unknown,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     elif token.word == "軽そう" and token.katakana_reading == "ケイソウ" and token.headword == "軽装":
         yield MecabParsedToken(
@@ -272,6 +372,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="カル",
             part_of_speech=PartOfSpeech.i_adjective,
             inflection_type=Inflection.garu_attached,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
         yield MecabParsedToken(
             word="そう",
@@ -279,6 +384,11 @@ def replace_mistake(token: MecabParsedToken, context: Sequence[WrappedToken], po
             katakana_reading="ソウ",
             part_of_speech=PartOfSpeech.adverb,
             inflection_type=Inflection.unknown,
+            inflection_type_raw=None,
+            inflection_form=None,
+            pos2=None,
+            pos3=None,
+            pos4=None,
         )
     else:
         yield token

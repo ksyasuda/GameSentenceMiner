@@ -4,7 +4,7 @@ import dataclasses
 import io
 import re
 from collections.abc import Iterable, Sequence
-from typing import Optional
+from typing import List, Optional
 
 try:
     from .basic_mecab_controller import BasicMecabController
@@ -19,6 +19,7 @@ try:
     from .kana_conv import is_kana_str, to_hiragana, to_katakana
     from .lru_cache import LRUCache
     from .replace_mistakes import replace_mistakes
+    from .token_merger import MergedToken, merge_tokens
 except ImportError:
     from basic_mecab_controller import BasicMecabController
     from basic_types import (
@@ -32,6 +33,7 @@ except ImportError:
     from kana_conv import is_kana_str, to_hiragana, to_katakana
     from lru_cache import LRUCache
     from replace_mistakes import replace_mistakes
+    from token_merger import MergedToken, merge_tokens
 
 
 # Mecab
@@ -73,11 +75,15 @@ class MecabController:
         self._cache.set_capacity(cache_max_size)
         self._verbose = verbose
 
-    def translate(self, expr: str) -> Sequence[MecabParsedToken]:
+    def translate(self, expr: str, mimic_yomitan: bool = False) -> Sequence[MecabParsedToken] | List[MergedToken]:
         try:
-            return self._cache[expr]
+            tokens = self._cache[expr]
         except KeyError:
-            return self._cache.setdefault(expr, tuple(self._translate(expr)))
+            tokens = self._cache.setdefault(expr, tuple(self._translate(expr)))
+
+        if mimic_yomitan:
+            return merge_tokens(list(tokens))
+        return tokens
 
     def _translate(self, expr: str) -> Iterable[MecabParsedToken]:
         """Analyzes expr with mecab. Fixes mecab's mistakes. Returns a parsed token for each word in expr."""
@@ -96,21 +102,54 @@ class MecabController:
                 break
             components = section.split(Separators.component)
             try:
-                word, headword, katakana_reading, part_of_speech, inflection = components
+                (
+                    word,
+                    headword,
+                    katakana_reading,
+                    part_of_speech,
+                    inflection_type,
+                    inflection_form,
+                    pos2,
+                    pos3,
+                    pos4,
+                ) = components
             except ValueError:
                 # unknown to mecab, gave the same word back
                 word, headword, katakana_reading = components * 3
-                part_of_speech, inflection = None, None
+                part_of_speech, inflection_type, inflection_form, pos2, pos3, pos4 = (
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
 
             if is_kana_str(word) or to_katakana(word) == to_katakana(katakana_reading):
                 katakana_reading = None
+
+            # Store raw inflection_type for copula checks (needed for merge decisions)
+            raw_inflection_type = (
+                inflection_type
+                if inflection_type and inflection_type != "*"
+                else None
+            )
 
             yield MecabParsedToken(
                 word=word,
                 headword=headword,
                 katakana_reading=(katakana_reading or None),
                 part_of_speech=PartOfSpeech(part_of_speech or None),
-                inflection_type=Inflection(inflection or None),
+                inflection_type=Inflection(inflection_form or None),  # Use form (活用形), not type (活用型)
+                inflection_type_raw=raw_inflection_type,
+                inflection_form=(
+                    inflection_form
+                    if inflection_form and inflection_form != "*"
+                    else None
+                ),
+                pos2=(pos2 if pos2 and pos2 != "*" else None),
+                pos3=(pos3 if pos3 and pos3 != "*" else None),
+                pos4=(pos4 if pos4 and pos4 != "*" else None),
             )
 
     def reading(self, expr: str) -> str:
@@ -132,6 +171,11 @@ class MecabController:
             else:
                 buf.write(to_hiragana(out.word))
         return buf.getvalue()
+
+    def shutdown(self):
+        """Shutdown the underlying MeCab process."""
+        if self._mecab is not None:
+            self._mecab.shutdown()
 
 
 def main():
