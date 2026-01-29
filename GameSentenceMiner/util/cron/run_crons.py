@@ -22,6 +22,8 @@ class Crons(enum.Enum):
     DAILY_STATS_ROLLUP = 'daily_stats_rollup'
     USER_PLUGINS = "user_plugins"
     JITEN_UPGRADER = 'jiten_upgrader'
+    BACKFILL_TOKENIZATION = 'backfill_tokenization'
+    DAILY_TOKENIZATION = 'daily_tokenization'
 
 @dataclass
 class MockCron:
@@ -182,14 +184,14 @@ async def run_due_crons(force_task: Optional['Crons'] = None) -> dict:
     
     for cron in due_crons:
         logger.background(f"Executing scheduled task: {cron.name}")
-        
+
         detail = {
             'name': cron.name,
             'description': cron.description,
             'success': False,
             'error': None
         }
-        
+
         try:
             # Execute populate_games
             if cron.name == Crons.POPULATE_GAMES.value:
@@ -252,10 +254,44 @@ async def run_due_crons(force_task: Optional['Crons'] = None) -> dict:
                 executed_count += 1
                 detail['success'] = True
                 detail['result'] = result
-                
+
                 logger.background(f"Successfully executed {cron.name}")
                 logger.background(f"Upgraded: {result.get('upgraded_to_jiten', 0)} games, Not found: {result.get('not_found_on_jiten', 0)}")
-                
+
+            # Execute Backfill Tokenization (one-time job)
+            elif cron.name == Crons.BACKFILL_TOKENIZATION.value:
+                try:
+                    from GameSentenceMiner.util.cron.backfill_tokenization import backfill_tokenization
+                except ImportError as ie:
+                    logger.error(f"Failed to import backfill_tokenization module: {ie}", exc_info=True)
+                    raise
+                result = backfill_tokenization()
+
+                if cron.id != -1: CronTable.just_ran(cron.id)
+                executed_count += 1
+                detail['success'] = True
+                detail['result'] = result
+
+                logger.background(f"Successfully executed {cron.name}")
+                logger.background(f"Tokenized: {result.get('processed', 0)} lines, Failed: {result.get('failed', 0)}")
+
+            # Execute Daily Tokenization Catchup
+            elif cron.name == Crons.DAILY_TOKENIZATION.value:
+                try:
+                    from GameSentenceMiner.util.cron.daily_tokenization import daily_tokenization_catchup
+                except ImportError as ie:
+                    logger.error(f"Failed to import daily_tokenization module: {ie}", exc_info=True)
+                    raise
+                result = daily_tokenization_catchup()
+
+                if cron.id != -1: CronTable.just_ran(cron.id)
+                executed_count += 1
+                detail['success'] = True
+                detail['result'] = result
+
+                logger.background(f"Successfully executed {cron.name}")
+                logger.background(f"Tokenized: {result.get('processed', 0)} lines, Failed: {result.get('failed', 0)}")
+
             else:
                 logger.error(f"⚠️ Unknown scheduled task: {cron.name}")
                 detail['error'] = f"Unknown scheduled task: {cron.name}"

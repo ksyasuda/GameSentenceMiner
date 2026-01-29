@@ -11,6 +11,7 @@ Routes for game CRUD operations:
 
 from flask import Blueprint, request, jsonify
 from GameSentenceMiner.util.db import GameLinesTable
+from GameSentenceMiner.util.db import get_affected_word_kanji_ids, recalculate_frequencies_after_deletion
 from GameSentenceMiner.util.configuration import logger
 from GameSentenceMiner.util.cron import cron_scheduler
 
@@ -371,17 +372,21 @@ def api_delete_game_lines(game_id):
 
         game_name = game.title_original
 
-        # Get count of lines that will be deleted
-        lines_count = GameLinesTable._db.fetchone(
-            f"SELECT COUNT(*) FROM {GameLinesTable._table} WHERE game_id=?",
+        # Get line IDs that will be deleted for frequency recalculation
+        line_rows = GameLinesTable._db.fetchall(
+            f"SELECT id FROM {GameLinesTable._table} WHERE game_id=?",
             (game_id,),
         )
-        lines_to_delete = lines_count[0] if lines_count else 0
+        line_ids = [row[0] for row in line_rows]
+        lines_to_delete = len(line_ids)
 
         if lines_to_delete == 0:
             return jsonify(
                 {"error": "No lines found for this game"}
             ), 404
+
+        # Get affected word/kanji IDs BEFORE deletion
+        word_ids, kanji_ids = get_affected_word_kanji_ids(line_ids)
 
         # PERMANENTLY DELETE all lines for this game
         GameLinesTable._db.execute(
@@ -389,6 +394,11 @@ def api_delete_game_lines(game_id):
             (game_id,),
             commit=True,
         )
+
+        # Recalculate frequencies AFTER deletion
+        if word_ids or kanji_ids:
+            freq_result = recalculate_frequencies_after_deletion(word_ids, kanji_ids)
+            logger.debug(f"Recalculated frequencies for game {game_name}: {freq_result}")
 
         # Also delete the game record from games table
         GameLinesTable._db.execute(

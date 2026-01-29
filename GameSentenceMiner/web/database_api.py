@@ -15,6 +15,7 @@ import regex
 
 from GameSentenceMiner.util.db import GameLinesTable
 from GameSentenceMiner.util.db import gsm_db, get_db_directory
+from GameSentenceMiner.util.db import get_affected_word_kanji_ids, recalculate_frequencies_after_deletion
 from GameSentenceMiner.util.stats_rollup_table import StatsRollupTable
 from GameSentenceMiner.util.configuration import (
     get_stats_config,
@@ -126,8 +127,14 @@ def delete_text_lines(regex_pattern=None, exact_text=None, case_sensitive=False,
     # Delete the matching lines
     deleted_count = 0
     failed_ids = []
-    
-    for line_id in set(lines_to_delete):  # Remove duplicates
+
+    # Get unique line IDs to delete
+    unique_line_ids = list(set(lines_to_delete))
+
+    # Get affected word/kanji IDs BEFORE deletion
+    word_ids, kanji_ids = get_affected_word_kanji_ids(unique_line_ids)
+
+    for line_id in unique_line_ids:
         try:
             GameLinesTable._db.execute(
                 f"DELETE FROM {GameLinesTable._table} WHERE id=?",
@@ -138,11 +145,16 @@ def delete_text_lines(regex_pattern=None, exact_text=None, case_sensitive=False,
         except Exception as e:
             logger.warning(f"Failed to delete line {line_id}: {e}")
             failed_ids.append(line_id)
-    
+
+    # Recalculate frequencies AFTER deletion
+    if deleted_count > 0 and (word_ids or kanji_ids):
+        freq_result = recalculate_frequencies_after_deletion(word_ids, kanji_ids)
+        logger.debug(f"Recalculated frequencies: {freq_result}")
+
     logger.info(
         f"Deleted {deleted_count} lines using pattern: {regex_pattern or exact_text}"
     )
-    
+
     return {"deleted_count": deleted_count, "failed_ids": failed_ids}
 
 
@@ -266,8 +278,14 @@ def deduplicate_lines_core(games, time_window_minutes=5, case_sensitive=False,
     # Delete the duplicate lines
     deleted_count = 0
     failed_ids = []
-    
-    for line_id in set(duplicates_to_remove):  # Remove duplicates from deletion list
+
+    # Get unique line IDs to delete
+    unique_line_ids = list(set(duplicates_to_remove))
+
+    # Get affected word/kanji IDs BEFORE deletion
+    word_ids, kanji_ids = get_affected_word_kanji_ids(unique_line_ids)
+
+    for line_id in unique_line_ids:
         try:
             GameLinesTable._db.execute(
                 f"DELETE FROM {GameLinesTable._table} WHERE id=?",
@@ -278,7 +296,12 @@ def deduplicate_lines_core(games, time_window_minutes=5, case_sensitive=False,
         except Exception as e:
             logger.warning(f"Failed to delete duplicate line {line_id}: {e}")
             failed_ids.append(line_id)
-    
+
+    # Recalculate frequencies AFTER deletion
+    if deleted_count > 0 and (word_ids or kanji_ids):
+        freq_result = recalculate_frequencies_after_deletion(word_ids, kanji_ids)
+        logger.debug(f"Recalculated frequencies after deduplication: {freq_result}")
+
     mode_desc = (
         "entire game"
         if ignore_time_window
@@ -287,7 +310,7 @@ def deduplicate_lines_core(games, time_window_minutes=5, case_sensitive=False,
     logger.info(
         f"Deduplication completed: removed {deleted_count} duplicate sentences from {len(games)} games with {mode_desc}"
     )
-    
+
     return {"deleted_count": deleted_count, "failed_ids": failed_ids}
 
 
@@ -788,6 +811,9 @@ def register_database_api_routes(app):
             if not isinstance(line_ids, list):
                 return jsonify({"error": "line_ids must be a list"}), 400
 
+            # Get affected word/kanji IDs BEFORE deletion
+            word_ids, kanji_ids = get_affected_word_kanji_ids(line_ids)
+
             # Delete the lines
             deleted_count = 0
             failed_ids = []
@@ -803,6 +829,11 @@ def register_database_api_routes(app):
                 except Exception as e:
                     logger.warning(f"Failed to delete line {line_id}: {e}")
                     failed_ids.append(line_id)
+
+            # Recalculate frequencies AFTER deletion
+            if deleted_count > 0 and (word_ids or kanji_ids):
+                freq_result = recalculate_frequencies_after_deletion(word_ids, kanji_ids)
+                logger.debug(f"Recalculated frequencies: {freq_result}")
 
             logger.info(
                 f"Deleted {deleted_count} sentence lines out of {len(line_ids)} requested"
@@ -909,9 +940,13 @@ def register_database_api_routes(app):
             # Delete each game's data
             for game_name in game_names:
                 try:
-                    # Get lines for this game before deletion for counting
+                    # Get lines for this game before deletion for counting and frequency recalculation
                     lines = GameLinesTable.get_all_lines_for_scene(game_name)
                     lines_count = len(lines)
+                    line_ids = [line.id for line in lines]
+
+                    # Get affected word/kanji IDs BEFORE deletion
+                    word_ids, kanji_ids = get_affected_word_kanji_ids(line_ids)
 
                     # Delete all lines for this game using the database connection
                     GameLinesTable._db.execute(
@@ -919,6 +954,11 @@ def register_database_api_routes(app):
                         (game_name,),
                         commit=True,
                     )
+
+                    # Recalculate frequencies AFTER deletion
+                    if lines_count > 0 and (word_ids or kanji_ids):
+                        freq_result = recalculate_frequencies_after_deletion(word_ids, kanji_ids)
+                        logger.debug(f"Recalculated frequencies for game {game_name}: {freq_result}")
 
                     deletion_results[game_name] = {
                         "deleted_sentences": lines_count,

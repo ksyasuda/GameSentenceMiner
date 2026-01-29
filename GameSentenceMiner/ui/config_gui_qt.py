@@ -602,7 +602,8 @@ class ConfigWindow(QWidget):
                 plaintext_websocket_port=int(self.plaintext_websocket_export_port_edit.text() or 0),
                 localhost_bind_address=self.localhost_bind_address_edit.text(),
                 longest_sleep_time=float(self.longest_sleep_time_edit.text() or 5.0),
-                dont_collect_stats=self.dont_collect_stats_check.isChecked()
+                dont_collect_stats=self.dont_collect_stats_check.isChecked(),
+                enable_realtime_tokenization=self.enable_tokenization_check.isChecked()
             ),
             ai=Ai(
                 add_to_anki=self.ai_enabled_check.isChecked(),
@@ -772,7 +773,7 @@ class ConfigWindow(QWidget):
         self.target_language_combo = QComboBox()
         self.locale_combo = QComboBox()
         self.notify_on_update_check = QCheckBox()
-        
+
         # Paths
         self.folder_to_watch_edit = QLineEdit()
         self.output_folder_edit = QLineEdit()
@@ -944,6 +945,7 @@ class ConfigWindow(QWidget):
         self.localhost_bind_address_edit = QLineEdit()
         self.longest_sleep_time_edit = QLineEdit()
         self.dont_collect_stats_check = QCheckBox()
+        self.enable_tokenization_check = QCheckBox()
         self.current_version_label = QLabel()
         self.latest_version_label = QLabel()
 
@@ -1206,7 +1208,7 @@ class ConfigWindow(QWidget):
         layout.addRow(self._create_labeled_widget(i18n, 'advanced', 'plaintext_export_port'), self.plaintext_websocket_export_port_edit)
         layout.addRow(self._create_labeled_widget(i18n, 'general', 'native_language'), self.native_language_combo)
         layout.addRow(self._create_labeled_widget(i18n, 'features', 'notify_on_update'), self.notify_on_update_check)
-        
+
         # Discord Settings Group
         self.discord_settings_group.setTitle("Discord Rich Presence")
         self.discord_settings_group.setStyleSheet("""
@@ -1832,7 +1834,10 @@ class ConfigWindow(QWidget):
         dont_collect_stats_container.addWidget(dont_collect_stats_warning)
         dont_collect_stats_container.addStretch()
         layout.addRow(dont_collect_stats_label, dont_collect_stats_container)
-        
+
+        # Realtime tokenization controls
+        layout.addRow(self._create_labeled_widget(i18n, 'advanced', 'enable_realtime_tokenization', color=LabelColor.DEFAULT), self.enable_tokenization_check)
+
         layout.addRow(self._create_labeled_widget(i18n, 'advanced', 'current_version'), self.current_version_label)
         layout.addRow(self._create_labeled_widget(i18n, 'advanced', 'latest_version'), self.latest_version_label)
 
@@ -1918,7 +1923,7 @@ class ConfigWindow(QWidget):
         self.locale_combo.blockSignals(False)
         
         self.notify_on_update_check.setChecked(s.features.notify_on_update)
-        
+
         # Discord Settings
         self.discord_enabled_check.setChecked(self.master_config.discord.enabled)
         # self.discord_update_interval_spin.setValue(self.master_config.discord.update_interval)
@@ -2121,6 +2126,7 @@ class ConfigWindow(QWidget):
         self.localhost_bind_address_edit.setText(s.advanced.localhost_bind_address)
         self.longest_sleep_time_edit.setText(str(s.advanced.longest_sleep_time))
         self.dont_collect_stats_check.setChecked(s.advanced.dont_collect_stats)
+        self.enable_tokenization_check.setChecked(s.advanced.enable_realtime_tokenization)
         self.current_version_label.setText(get_current_version())
         self.latest_version_label.setText(get_latest_version())
         

@@ -696,6 +696,8 @@ class Advanced:
     audio_backend: str = 'sounddevice' # 'sounddevice' or 'qt6'
     slowest_polling_rate: int = 5000  # in ms
     longest_sleep_time: float = 5.0
+    enable_realtime_tokenization: bool = True  # Enable realtime tokenization as lines arrive. Cron jobs will backfill if disabled.
+
 
     def __post_init__(self):
         if self.plaintext_websocket_port == -1:

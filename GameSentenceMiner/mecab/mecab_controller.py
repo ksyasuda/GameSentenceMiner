@@ -8,6 +8,10 @@ from typing import List, Optional
 
 try:
     from .basic_mecab_controller import BasicMecabController
+    from .persistent_mecab_controller import (
+        PersistentMecabController,
+        get_persistent_mecab,
+    )
     from .basic_types import (
         COMPONENTS,
         Inflection,
@@ -22,6 +26,10 @@ try:
     from .token_merger import MergedToken, merge_tokens
 except ImportError:
     from basic_mecab_controller import BasicMecabController
+    from persistent_mecab_controller import (
+        PersistentMecabController,
+        get_persistent_mecab,
+    )
     from basic_types import (
         COMPONENTS,
         Inflection,
@@ -56,9 +64,10 @@ class MecabController:
         "--unk-format=" + COMPONENTS.word + Separators.node,
         "--eos-format=" + Separators.footer,
     ]
-    _mecab: BasicMecabController
+    _mecab: BasicMecabController | PersistentMecabController
     _verbose: bool
     _cache: LRUCache[str, Sequence[MecabParsedToken]] = LRUCache()
+    _persistent: bool = False
 
     def __init__(
         self,
@@ -66,14 +75,24 @@ class MecabController:
         mecab_args: Optional[list[str]] = None,
         verbose: bool = False,
         cache_max_size: int = 1024,
+        persistent: bool = False,
     ) -> None:
-        self._mecab = BasicMecabController(
-            mecab_cmd=mecab_cmd,
-            mecab_args=(mecab_args or self._mecab_args),
-            verbose=verbose,
-        )
+        match persistent:
+            case True:
+                self._mecab = get_persistent_mecab(
+                    mecab_cmd=mecab_cmd,
+                    mecab_args=(mecab_args or self._mecab_args),
+                    verbose=verbose,
+                )
+            case False:
+                self._mecab = BasicMecabController(
+                    mecab_cmd=mecab_cmd,
+                    mecab_args=(mecab_args or self._mecab_args),
+                    verbose=verbose,
+                )
         self._cache.set_capacity(cache_max_size)
         self._verbose = verbose
+        self._persistent = persistent
 
     def translate(self, expr: str, mimic_yomitan: bool = False) -> Sequence[MecabParsedToken] | List[MergedToken]:
         try:
@@ -171,12 +190,6 @@ class MecabController:
             else:
                 buf.write(to_hiragana(out.word))
         return buf.getvalue()
-
-    def shutdown(self):
-        """Shutdown the underlying MeCab process."""
-        if self._mecab is not None:
-            self._mecab.shutdown()
-
 
 def main():
     mecab = MecabController()
