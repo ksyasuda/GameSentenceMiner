@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 
 from GameSentenceMiner.util.configuration import logger
 from GameSentenceMiner.web.stats import is_kanji
-from GameSentenceMiner.mecab.basic_types import PartOfSpeech
+from GameSentenceMiner.mecab.basic_types import PartOfSpeech, MecabParsedToken
 from GameSentenceMiner.util.db import (
     WordsTable,
     KanjiTable,
@@ -27,8 +27,18 @@ _FILTERABLE_POS = frozenset(
         PartOfSpeech.bound_auxiliary,  # 助動詞 - だ, です, ない, ます, た
         PartOfSpeech.filler,  # フィラー - なんか, あのー, えーと
         PartOfSpeech.other,  # その他 - miscellaneous
+        PartOfSpeech.unknown,  # unrecognized tokens (garbage, unusual punctuation)
     )
 )
+
+
+def _is_symbol_only(text: str) -> bool:
+    """Return True if text consists entirely of punctuation/symbols."""
+    from unicodedata import category
+
+    return bool(text) and all(
+        category(c).startswith(("P", "S", "Z")) for c in text
+    )
 
 
 @dataclass
@@ -129,12 +139,22 @@ class TokenizationService:
         return reading
 
     @staticmethod
-    def _extract_tokens_and_kanji(line_text: str, tokens) -> tuple:
+    def _extract_tokens_and_kanji(
+        line_text: str,
+        tokens: List[MecabParsedToken],
+        filter_pos: Optional[List[PartOfSpeech]] = None,
+    ) -> tuple:
         """
         Extract merged word data and kanji data from MeCab tokens.
 
         Uses Yomitan-style merging to combine verbs with their auxiliaries/particles
         for more natural word boundaries (e.g., 食べて instead of 食べ + て).
+
+        Args:
+            line_text: The original text (used for kanji extraction)
+            tokens: List of MeCab parsed tokens
+            filter_pos: Optional list of PartOfSpeech values to filter out.
+                        If None, uses _FILTERABLE_POS. Pass empty list to disable filtering.
 
         Returns:
             (word_data, kanji_data) where:
@@ -145,20 +165,22 @@ class TokenizationService:
 
         merged_tokens = merge_tokens(list(tokens))
 
+        effective_filter_pos = set(filter_pos) if filter_pos is not None else _FILTERABLE_POS
+        quote_chars = frozenset(("「", "」"))
+
         word_data = []
         for merged in merged_tokens:
-            # Skip tokens that are purely filterable (standalone particles, etc.)
-            # but keep merged tokens even if they end with a filterable POS
-            if (
-                TokenizationService.is_filterable_pos(merged.part_of_speech)
-                and not merged.is_merged
+            if merged.surface in quote_chars or merged.headword in quote_chars:
+                continue
+
+            if effective_filter_pos and (
+                (merged.part_of_speech in effective_filter_pos and not merged.is_merged)
+                or _is_symbol_only(merged.headword)
             ):
                 continue
 
             pos_str = merged.part_of_speech.name if merged.part_of_speech else ""
-            reading = TokenizationService._normalize_reading(
-                merged.reading, merged.headword
-            )
+            reading = merged.reading
             word_data.append(
                 {
                     "headword": merged.headword,
@@ -196,14 +218,19 @@ class TokenizationService:
         )
 
     def tokenize_line(
-        self, game_line_id: str, line_text: str, timestamp: float, game_id: str = ""
+        self,
+        game_line_id: str,
+        line_text: str,
+        timestamp: float,
+        game_id: str = "",
+        filter_pos: Optional[List[PartOfSpeech]] = None,
     ) -> bool:
         """
         Tokenize a game line and store results in the database using a single transaction.
 
         This method:
         1. Parses the line with Mecab to extract tokens
-        2. Filters out particles and symbols
+        2. Filters out particles and symbols (based on filter_pos)
         3. Extracts kanji characters
         4. Performs bulk lookups for existing words/kanji
         5. Executes all inserts/updates in a single transaction
@@ -214,13 +241,17 @@ class TokenizationService:
             line_text: The Japanese text to tokenize
             timestamp: Unix timestamp of when the line was created
             game_id: Optional game ID for the occurrence mapping
+            filter_pos: Optional list of PartOfSpeech values to filter out.
+                        If None, uses _FILTERABLE_POS. Pass empty list to disable filtering.
 
         Returns:
             True if tokenization succeeded, False otherwise
         """
         try:
-            tokens = self.mecab.translate(line_text)
-            word_items, kanji_items = self._extract_tokens_and_kanji(line_text, tokens)
+            tokens = self.mecab.translate(line_text) if line_text else []
+            word_items, kanji_items = self._extract_tokens_and_kanji(
+                line_text, tokens, filter_pos=filter_pos
+            )
 
             word_data = [
                 (w["headword"], w["word"], w["reading"], w["pos"], w["position"])
@@ -658,7 +689,12 @@ class TokenizationService:
 
         return word_occurrences_data, kanji_occurrences_data
 
-    def tokenize_batch(self, lines: list, chunk_size: int = 100) -> dict:
+    def tokenize_batch(
+        self,
+        lines: list,
+        chunk_size: int = 100,
+        filter_pos: Optional[List[PartOfSpeech]] = None,
+    ) -> dict:
         """
         Optimized batch tokenization using bulk database operations with memory-bounded chunks.
 
@@ -668,6 +704,8 @@ class TokenizationService:
         Args:
             lines: List of tuples (line_id, line_text, timestamp, game_id) or (line_id, line_text, timestamp)
             chunk_size: Number of lines to process per sub-batch (default 100)
+            filter_pos: Optional list of PartOfSpeech values to filter out.
+                        If None, uses _FILTERABLE_POS. Pass empty list to disable filtering.
 
         Returns:
             Dictionary with 'processed' and 'failed' counts, 'interrupted' if shutdown
@@ -696,7 +734,9 @@ class TokenizationService:
             chunk = lines[i : i + chunk_size]
 
             try:
-                tokenized_data, chunk_failed_ids = self._tokenize_lines_parallel(chunk)
+                tokenized_data, chunk_failed_ids = self._tokenize_lines_parallel(
+                    chunk, filter_pos=filter_pos
+                )
                 all_failed_ids.extend(chunk_failed_ids)
 
                 if self._shutdown:
@@ -725,7 +765,11 @@ class TokenizationService:
             "failed_ids": list(dict.fromkeys(all_failed_ids)),
         }
 
-    def _tokenize_lines_parallel(self, lines: list) -> tuple:
+    def _tokenize_lines_parallel(
+        self,
+        lines: list,
+        filter_pos: Optional[List[PartOfSpeech]] = None,
+    ) -> tuple:
         """
         Tokenize multiple lines in parallel using MeCab (no database operations).
 
@@ -734,6 +778,7 @@ class TokenizationService:
 
         Args:
             lines: List of line tuples
+            filter_pos: Optional list of PartOfSpeech values to filter out.
 
         Returns:
             Tuple of (results: list[dict], failed_ids: list[str]) where failed_ids
@@ -766,7 +811,7 @@ class TokenizationService:
 
                 tokens = self.mecab.translate(line_text)
                 word_data, kanji_data = self._extract_tokens_and_kanji(
-                    line_text, tokens
+                    line_text, tokens, filter_pos=filter_pos
                 )
 
                 return {

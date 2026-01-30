@@ -138,6 +138,15 @@ def _is_verb_non_independent(tok: MecabParsedToken) -> bool:
     return True
 
 
+def _can_receive_auxiliary(tok: MecabParsedToken) -> bool:
+    """Check if token can grammatically receive auxiliaries like た/だ/ば/たって."""
+    return tok.part_of_speech in (
+        PartOfSpeech.verb,
+        PartOfSpeech.bound_auxiliary,
+        PartOfSpeech.i_adjective,
+    )
+
+
 def _is_noun_suffix(tok: MecabParsedToken) -> bool:
     """
     isNounSuffix (ipadic) = (tok) => tok.pos1 === '動詞' && tok.pos2 === '接尾'
@@ -198,20 +207,24 @@ def _should_merge(
     if _is_counter(token) and _is_numeral(last_standalone_token):
         return True
 
-    # ば particle (conditional) - always merges
-    if _is_ba_particle(token):
+    # ば particle (conditional) - only merges with verb/auxiliary/adjective
+    if _is_ba_particle(token) and _can_receive_auxiliary(last_standalone_token):
         return True
 
-    # たって particle - always merges
-    if _is_tatte_particle(token):
+    # たって particle - only merges with verb/auxiliary/adjective
+    if _is_tatte_particle(token) and _can_receive_auxiliary(last_standalone_token):
         return True
 
     # て/で particle after continuative form
     if _is_te_de_particle(token) and _is_continuative_form(last_standalone_token):
         return True
 
-    # た/だ auxiliary - always merges (allows adjectives too, e.g., なかった)
-    if _is_ta_da_particle(token):
+    # た/だ auxiliary - only merges with verb/auxiliary/adjective (e.g., なかった)
+    if _is_ta_da_particle(token) and _can_receive_auxiliary(last_standalone_token):
+        return True
+
+    # After て/で particle, merge with auxiliary verbs (しまう, いる, ある, おく, みる, etc.)
+    if _is_te_de_particle(last_standalone_token) and _is_verb_suffix(token):
         return True
 
     return False
