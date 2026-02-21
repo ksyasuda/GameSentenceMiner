@@ -16,11 +16,15 @@ from contextlib import contextmanager
 from datetime import datetime
 from datetime import timedelta
 from sys import platform
-from typing import Any, Dict, List, Optional, Tuple, Union, Type, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Type, TypeVar
 
 from GameSentenceMiner.util.config.configuration import get_config, get_stats_config, logger, is_dev, \
     sanitize_and_resolve_path
 from GameSentenceMiner.util.text_log import GameLine
+
+TOKENIZED_PENDING = 0
+TOKENIZED_DONE = 1
+TOKENIZED_RETRYABLE_FAILED = 2
 
 # Matches any Unicode punctuation (\p{P}), symbol (\p{S}), or separator (\p{Z}); \p{Z} includes whitespace/separator chars
 punctuation_regex = regex.compile(r'[\p{P}\p{S}\p{Z}]')
@@ -47,10 +51,11 @@ class SQLiteDB:
         if self.read_only:
             # Use URI mode for read-only
             uri = f"file:{self.db_path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=30.0)
         else:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.execute("PRAGMA busy_timeout = 5000")
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -225,22 +230,110 @@ class SQLiteDBTable:
         if not hasattr(cls, '_fields') or not cls._fields:
             raise NotImplementedError(f"{cls.__name__} must define _fields")
 
+    _PYTHON_TO_SQLITE = {
+        int: "INTEGER",
+        float: "REAL",
+        str: "TEXT",
+        list: "TEXT",
+        dict: "TEXT",
+        bool: "INTEGER",
+    }
+
+    @classmethod
+    def _build_create_table_sql(cls, table_name: str, include_if_not_exists: bool = True) -> str:
+        fields_def = ", ".join([cls._field_ddl(field) for field in cls._fields])
+        pk_def = f"{cls._pk} TEXT PRIMARY KEY" if not cls._auto_increment else f"{cls._pk} INTEGER PRIMARY KEY AUTOINCREMENT"
+
+        fk_defs = []
+        for fk in getattr(cls, '_foreign_keys', []) or []:
+            if len(fk) >= 3:
+                column, ref_table, ref_column = fk[:3]
+                fk_sql = f"FOREIGN KEY ({column}) REFERENCES {ref_table}({ref_column})"
+                if len(fk) > 3 and fk[3]:
+                    fk_sql += f" ON DELETE {fk[3]}"
+                fk_defs.append(fk_sql)
+
+        if fk_defs:
+            fields_def = ", ".join([fields_def, *fk_defs])
+        exists_clause = "IF NOT EXISTS " if include_if_not_exists else ""
+        return f"CREATE TABLE {exists_clause}{table_name} ({pk_def}, {fields_def})"
+
+    @classmethod
+    def _sqlite_type_for_field(cls, field: str) -> str:
+        if field == cls._pk:
+            if not cls._types:
+                logger.warning(
+                    f"{cls.__name__} is missing a primary-key type in _types; defaulting id type to TEXT."
+                )
+                return "TEXT"
+            return cls._PYTHON_TO_SQLITE.get(cls._types[0], "TEXT")
+
+        if field not in cls._fields:
+            logger.warning(f"{cls.__name__} requested SQLite type for unknown field '{field}'.")
+            return "TEXT"
+
+        type_idx = cls._fields.index(field) + 1
+        expected_type_count = len(cls._fields) + 1
+        if len(cls._types) != expected_type_count or len(cls._types) <= type_idx:
+            logger.warning(
+                f"{cls.__name__} expected {expected_type_count} _types entries "
+                f"(pk + {len(cls._fields)} fields) but found {len(cls._types)}; "
+                f"defaulting field '{field}' to inferred type."
+            )
+        else:
+            return cls._PYTHON_TO_SQLITE.get(cls._types[type_idx], "TEXT")
+
+        if hasattr(cls, '_defaults') and field in cls._defaults:
+            default_val = cls._defaults[field]
+            return cls._PYTHON_TO_SQLITE.get(type(default_val), "TEXT")
+
+        return "TEXT"
+
+    @classmethod
+    def _field_ddl(cls, field: str) -> str:
+        col_type = cls._sqlite_type_for_field(field)
+        defaults = getattr(cls, '_defaults', {}) or {}
+        if field in defaults:
+            val = defaults[field]
+            if val is None:
+                return f"{field} {col_type} DEFAULT NULL"
+            if isinstance(val, (int, float)):
+                return f"{field} {col_type} DEFAULT {val}"
+            safe = str(val).replace("'", "''")
+            return f"{field} {col_type} DEFAULT '{safe}'"
+        return f"{field} {col_type}"
+
     @classmethod
     def set_db(cls, db: SQLiteDB):
         cls._db = db
         cls._column_order_cache = None  # Reset cache when database changes
         # Ensure table exists
         if not db.table_exists(cls._table):
-            fields_def = ', '.join([f"{field} TEXT" for field in cls._fields])
-            pk_def = f"{cls._pk} TEXT PRIMARY KEY" if not cls._auto_increment else f"{cls._pk} INTEGER PRIMARY KEY AUTOINCREMENT"
-            create_table_sql = f"CREATE TABLE IF NOT EXISTS {cls._table} ({pk_def}, {fields_def})"
+            create_table_sql = cls._build_create_table_sql(cls._table, include_if_not_exists=True)
             db.create_table(create_table_sql)
         # Check for missing columns and add them
         existing_columns = [col[1] for col in db.fetchall(f"PRAGMA table_info({cls._table})")]
         for field in cls._fields:
             if field not in existing_columns:
-                db.execute(f"ALTER TABLE {cls._table} ADD COLUMN {field} TEXT", commit=True)
+                db.execute(f"ALTER TABLE {cls._table} ADD COLUMN {cls._field_ddl(field)}", commit=True)
                 cls._column_order_cache = None  # Reset cache when schema changes
+
+        # Ensure indexes exist
+        indexes = getattr(cls, '_indexes', None) or []
+        for index_def in indexes:
+            cols, is_unique, custom_name = index_def
+            if isinstance(cols, tuple):
+                col_expr = ', '.join(cols)
+                default_name = f"idx_{cls._table}_{'_'.join(cols)}"
+            else:
+                col_expr = cols
+                default_name = f"idx_{cls._table}_{cols}"
+            idx_name = custom_name or default_name
+            unique_kw = "UNIQUE " if is_unique else ""
+            db.execute(
+                f"CREATE {unique_kw}INDEX IF NOT EXISTS {idx_name} ON {cls._table}({col_expr})",
+                commit=True,
+            )
 
     @classmethod
     def all(cls: Type[T]) -> List[T]:
@@ -670,11 +763,25 @@ class GameLinesTable(SQLiteDBTable):
     _table = 'game_lines'
     _sync_changes_table = 'sync_game_line_changes'
     _fields = ['game_name', 'line_text', 'screenshot_in_anki',
-               'audio_in_anki', 'screenshot_path', 'audio_path', 'replay_path', 'translation', 'language', 'timestamp', 'original_game_name', 'game_id', 'note_ids', 'last_modified']
+               'audio_in_anki', 'screenshot_path', 'audio_path', 'replay_path', 'translation',
+               'language', 'timestamp', 'original_game_name', 'game_id',
+               'note_ids', 'last_modified', 'tokenized',
+               'total_length', 'filtered_length', 'word_count', 'kanji_count']
     _types = [str,  # Includes primary key type
-              str, str, str, str, str, str, str, str, str, float, str, str, list, float]
+              str, str, str, str, str, str, str, str, str, float, str, str, list, float,
+              int, int, int, int, int]
     _pk = 'id'
     _auto_increment = False  # Use string IDs
+    _defaults = {
+        'tokenized': TOKENIZED_PENDING,
+        'total_length': 0,
+        'filtered_length': 0,
+        'word_count': 0,
+        'kanji_count': 0
+    }
+    _indexes = [
+        ('tokenized', False, None),
+    ]
 
     def __init__(self, id: Optional[str] = None,
                  game_name: Optional[str] = None,
@@ -691,7 +798,12 @@ class GameLinesTable(SQLiteDBTable):
                  original_game_name: Optional[str] = None,
                  game_id: Optional[str] = None,
                  note_ids: Optional[List[str]] = None,
-                 last_modified: Optional[float] = None):
+                 last_modified: Optional[float] = None,
+                 tokenized: Optional[int] = TOKENIZED_PENDING,
+                 total_length: Optional[int] = 0,
+                 filtered_length: Optional[int] = 0,
+                 word_count: Optional[int] = 0,
+                 kanji_count: Optional[int] = 0):
         self.id = id
         self.game_name = game_name
         self.line_text = line_text
@@ -708,6 +820,11 @@ class GameLinesTable(SQLiteDBTable):
         self.game_id = game_id if game_id is not None else ''
         self.note_ids = note_ids
         self.last_modified = last_modified if last_modified is not None else time.time()
+        self.tokenized = tokenized if tokenized is not None else TOKENIZED_PENDING
+        self.total_length = total_length if total_length is not None else 0
+        self.filtered_length = filtered_length if filtered_length is not None else 0
+        self.word_count = word_count if word_count is not None else 0
+        self.kanji_count = kanji_count if kanji_count is not None else 0
         
     @classmethod
     def all(cls, for_stats: bool = False) -> List['GameLinesTable']:
@@ -764,6 +881,19 @@ class GameLinesTable(SQLiteDBTable):
                        language=target_language)
         # logger.info("Adding GameLine to DB: %s", new_line)
         new_line.add()
+        try:
+            from GameSentenceMiner.util.tokenization_service import (
+                enqueue_realtime_tokenization,
+            )
+
+            enqueue_realtime_tokenization(
+                game_line_id=gameline.id,
+                line_text=gameline.text,
+                timestamp=gameline.time.timestamp(),
+                game_id=game_id or "",
+            )
+        except Exception as e:
+            logger.error(f"Realtime tokenization enqueue failed for line {gameline.id}: {e}")
         return new_line
     
     @classmethod
@@ -780,6 +910,20 @@ class GameLinesTable(SQLiteDBTable):
             params,
             commit=True
         )
+        try:
+            from GameSentenceMiner.util.tokenization_service import (
+                enqueue_realtime_tokenization,
+            )
+
+            for gl in gamelines:
+                enqueue_realtime_tokenization(
+                    game_line_id=gl.id,
+                    line_text=gl.text,
+                    timestamp=gl.time.timestamp(),
+                    game_id="",
+                )
+        except Exception as e:
+            logger.error(f"Realtime tokenization enqueue failed for batch insert: {e}")
 
     @staticmethod
     def _to_sync_note_ids(value: Any) -> List[str]:
@@ -1182,6 +1326,148 @@ class GoalsTable(SQLiteDBTable):
         
         return (current_streak, longest_streak)
 
+
+class WordsTable(SQLiteDBTable):
+    """
+    Table for storing unique words with frequency tracking.
+    Each row is unique by (headword, word, reading) combination.
+    Uses INTEGER auto-increment primary key for normalized schema.
+    """
+
+    _table = 'words'
+    _fields = [
+        'headword',    # TEXT (base/dictionary form)
+        'word',        # TEXT (surface form as appeared)
+        'reading',     # TEXT (katakana reading, "-" if none/same)
+        'first_seen',  # REAL (Unix timestamp)
+        'last_seen',   # REAL (Unix timestamp)
+        'frequency',   # INTEGER (occurrence count)
+    ]
+    _types = [int, str, str, str, float, float, int]  # Includes primary key type (INTEGER)
+    _pk = 'id'
+    _auto_increment = True  # Use INTEGER auto-increment primary key
+    _indexes = [
+        ('word', False, 'idx_words_word'),
+        (('headword', 'word', 'reading'), True, 'idx_words_unique'),
+    ]
+
+    def __init__(self, id: int = None, headword: str = '', word: str = '', reading: str = '-',
+                 first_seen: float = 0.0, last_seen: float = 0.0, frequency: int = 0):
+        super().__init__()
+        self.id = id
+        self.headword = headword
+        self.word = word
+        self.reading = reading
+        self.first_seen = first_seen
+        self.last_seen = last_seen
+        self.frequency = frequency
+
+
+class KanjiTable(SQLiteDBTable):
+    """
+    Table for storing unique kanji characters with frequency tracking.
+    Uses INTEGER auto-increment primary key for normalized schema.
+    """
+
+    _table = 'kanji'
+    _fields = [
+        'kanji',      # TEXT (the kanji character) with UNIQUE constraint
+        'first_seen',  # REAL (Unix timestamp)
+        'last_seen',   # REAL (Unix timestamp)
+        'frequency'    # INTEGER (total occurrence count)
+    ]
+    _types = [int, str, float, float, int]  # Includes primary key type (INTEGER)
+    _pk = 'id'
+    _auto_increment = True  # Use INTEGER auto-increment primary key
+    _indexes = [
+        ('kanji', True, 'idx_kanji_char'),
+    ]
+
+    def __init__(self, id: int = None, kanji: str = '', first_seen: float = 0.0,
+                 last_seen: float = 0.0, frequency: int = 0):
+        super().__init__()
+        self.id = id
+        self.kanji = kanji
+        self.first_seen = first_seen
+        self.last_seen = last_seen
+        self.frequency = frequency
+
+
+class WordOccurrencesTable(SQLiteDBTable):
+    """
+    Normalized mapping table linking words to game lines and games.
+    Uses integer word_id FK instead of denormalized text columns.
+    """
+
+    _table = 'word_occurrences'
+    _fields = [
+        'word_id',    # INTEGER (FK to words.id)
+        'line_id',    # TEXT (FK to game_lines.id)
+        'game_id',    # TEXT (FK to games.id)
+        'timestamp',  # REAL (Unix timestamp from game_lines)
+    ]
+    _types = [int, int, str, str, float]  # Includes primary key type (INTEGER)
+    _pk = 'id'
+    _auto_increment = True
+    _foreign_keys = [
+        ('word_id', 'words', 'id', 'CASCADE'),
+        ('line_id', 'game_lines', 'id', 'CASCADE'),
+        ('game_id', 'games', 'id', 'CASCADE'),
+    ]
+    _indexes = [
+        ('word_id', False, 'idx_word_occ_word_id'),
+        ('line_id', False, 'idx_word_occ_line_id'),
+        (('game_id', 'timestamp'), False, 'idx_word_occ_game_timestamp'),
+        (('word_id', 'line_id'), True, 'idx_word_occ_unique'),
+    ]
+
+    def __init__(self, id: int = None, word_id: int = None, line_id: str = '',
+                 game_id: str = None, timestamp: float = 0.0):
+        super().__init__()
+        self.id = id
+        self.word_id = word_id
+        self.line_id = line_id
+        self.game_id = game_id if game_id else None
+        self.timestamp = timestamp
+
+
+class KanjiOccurrencesTable(SQLiteDBTable):
+    """
+    Normalized mapping table linking kanji to game lines and games.
+    Uses integer kanji_id FK instead of denormalized text column.
+    """
+
+    _table = 'kanji_occurrences'
+    _fields = [
+        'kanji_id',   # INTEGER (FK to kanji.id)
+        'line_id',    # TEXT (FK to game_lines.id)
+        'game_id',    # TEXT (FK to games.id)
+        'timestamp',  # REAL (Unix timestamp from game_lines)
+    ]
+    _types = [int, int, str, str, float]  # Includes primary key type (INTEGER)
+    _pk = 'id'
+    _auto_increment = True
+    _foreign_keys = [
+        ('kanji_id', 'kanji', 'id', 'CASCADE'),
+        ('line_id', 'game_lines', 'id', 'CASCADE'),
+        ('game_id', 'games', 'id', 'CASCADE'),
+    ]
+    _indexes = [
+        ('kanji_id', False, 'idx_kanji_occ_kanji_id'),
+        ('line_id', False, 'idx_kanji_occ_line_id'),
+        (('game_id', 'timestamp'), False, 'idx_kanji_occ_game_timestamp'),
+        (('kanji_id', 'line_id'), True, 'idx_kanji_occ_unique'),
+    ]
+
+    def __init__(self, id: int = None, kanji_id: int = None, line_id: str = '',
+                 game_id: str = None, timestamp: float = 0.0):
+        super().__init__()
+        self.id = id
+        self.kanji_id = kanji_id
+        self.line_id = line_id
+        self.game_id = game_id if game_id else None
+        self.timestamp = timestamp
+
 # Ensure database directory exists and return path
 def get_db_directory(test=False, delete_test=False) -> str:
     if platform == 'win32':  # Windows
@@ -1253,7 +1539,8 @@ from GameSentenceMiner.util.database.games_table import GamesTable
 from GameSentenceMiner.util.database.cron_table import CronTable
 from GameSentenceMiner.util.database.stats_rollup_table import StatsRollupTable
 
-for cls in [AIModelsTable, GameLinesTable, GoalsTable, GamesTable, CronTable, StatsRollupTable]:
+for cls in [AIModelsTable, GameLinesTable, GoalsTable, GamesTable, CronTable, StatsRollupTable,
+            WordsTable, KanjiTable, WordOccurrencesTable, KanjiOccurrencesTable]:
     cls.set_db(gsm_db)
     # Uncomment to start fresh every time
     # cls.drop()
@@ -1620,6 +1907,46 @@ def check_and_run_migrations():
             logger.info(f"✅ Created jiten_upgrader scheduled task - next run: {next_sunday.strftime('%Y-%m-%d %H:%M:%S')} (Sunday 3:00 AM)")
         else:
             logger.debug("jiten_upgrader scheduled task already exists, skipping creation.")
+
+    def migrate_tokenization_crons():
+        try:
+            backfill_cron = CronTable.get_by_name("backfill_tokenization")
+            if not backfill_cron:
+                CronTable.create_cron_entry(
+                    name="backfill_tokenization",
+                    description="One-time backfill of Yomitan tokenization for existing game lines",
+                    next_run=(datetime.now() - timedelta(minutes=1)).timestamp(),
+                    schedule="once",
+                    enabled=True,
+                )
+
+            daily_cron = CronTable.get_by_name("daily_tokenization")
+            if not daily_cron:
+                next_run = datetime.now().replace(hour=1, minute=0, second=0, microsecond=0)
+                if next_run < datetime.now():
+                    next_run += timedelta(days=1)
+                CronTable.create_cron_entry(
+                    name="daily_tokenization",
+                    description="Daily catchup to tokenize lines that remain untokenized",
+                    next_run=next_run.timestamp(),
+                    schedule="daily",
+                    enabled=True,
+                )
+            elif daily_cron.enabled is False:
+                pending_lines = GameLinesTable._db.fetchone(
+                    f"SELECT id FROM {GameLinesTable._table} "
+                    "WHERE line_text IS NOT NULL "
+                    "  AND TRIM(line_text) != '' "
+                    f"  AND (COALESCE(tokenized, {TOKENIZED_PENDING}) = {TOKENIZED_PENDING} "
+                    f"OR COALESCE(tokenized, {TOKENIZED_PENDING}) = {TOKENIZED_RETRYABLE_FAILED}) "
+                    "LIMIT 1"
+                )
+                if pending_lines:
+                    daily_cron.enabled = True
+                    daily_cron.next_run = time.time()
+                daily_cron.save()
+        except Exception as e:
+            logger.error(f"⚠️ Failed to create tokenization cron jobs: {e}")
     
     def migrate_genres_and_tags():
         """
@@ -1673,6 +2000,7 @@ def check_and_run_migrations():
     migrate_genres_and_tags()  # Add genres and tags columns
     migrate_user_plugins_cron_job()
     migrate_jiten_upgrader_cron_job()  # Weekly check for new Jiten entries
+    migrate_tokenization_crons()
         
 check_and_run_migrations()
     
