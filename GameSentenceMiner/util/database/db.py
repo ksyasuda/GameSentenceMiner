@@ -79,7 +79,10 @@ class SQLiteDB:
             conn = self._get_connection()
             tx_depth = getattr(self._local, "tx_depth", 0)
             if tx_depth == 0:
-                conn.execute("BEGIN")
+                # If SQLite already has an open implicit transaction on this connection,
+                # adopt it instead of issuing BEGIN again.
+                if not conn.in_transaction:
+                    conn.execute("BEGIN")
             self._local.tx_depth = tx_depth + 1
 
         try:
@@ -1405,8 +1408,12 @@ class WordOccurrencesTable(SQLiteDBTable):
         'line_id',    # TEXT (FK to game_lines.id)
         'game_id',    # TEXT (FK to games.id)
         'timestamp',  # REAL (Unix timestamp from game_lines)
+        'count',      # INTEGER (occurrence count for this row)
     ]
-    _types = [int, int, str, str, float]  # Includes primary key type (INTEGER)
+    _types = [int, int, str, str, float, int]  # Includes primary key type (INTEGER)
+    _defaults = {
+        'count': 1,
+    }
     _pk = 'id'
     _auto_increment = True
     _foreign_keys = [
@@ -1422,13 +1429,14 @@ class WordOccurrencesTable(SQLiteDBTable):
     ]
 
     def __init__(self, id: int = None, word_id: int = None, line_id: str = '',
-                 game_id: str = None, timestamp: float = 0.0):
+                 game_id: str = None, timestamp: float = 0.0, count: int = 1):
         super().__init__()
         self.id = id
         self.word_id = word_id
         self.line_id = line_id
         self.game_id = game_id if game_id else None
         self.timestamp = timestamp
+        self.count = count if count is not None else 1
 
 
 class KanjiOccurrencesTable(SQLiteDBTable):
@@ -1443,8 +1451,12 @@ class KanjiOccurrencesTable(SQLiteDBTable):
         'line_id',    # TEXT (FK to game_lines.id)
         'game_id',    # TEXT (FK to games.id)
         'timestamp',  # REAL (Unix timestamp from game_lines)
+        'count',      # INTEGER (occurrence count for this row)
     ]
-    _types = [int, int, str, str, float]  # Includes primary key type (INTEGER)
+    _types = [int, int, str, str, float, int]  # Includes primary key type (INTEGER)
+    _defaults = {
+        'count': 1,
+    }
     _pk = 'id'
     _auto_increment = True
     _foreign_keys = [
@@ -1460,13 +1472,14 @@ class KanjiOccurrencesTable(SQLiteDBTable):
     ]
 
     def __init__(self, id: int = None, kanji_id: int = None, line_id: str = '',
-                 game_id: str = None, timestamp: float = 0.0):
+                 game_id: str = None, timestamp: float = 0.0, count: int = 1):
         super().__init__()
         self.id = id
         self.kanji_id = kanji_id
         self.line_id = line_id
         self.game_id = game_id if game_id else None
         self.timestamp = timestamp
+        self.count = count if count is not None else 1
 
 # Ensure database directory exists and return path
 def get_db_directory(test=False, delete_test=False) -> str:
@@ -1947,7 +1960,7 @@ def check_and_run_migrations():
                 daily_cron.save()
         except Exception as e:
             logger.error(f"⚠️ Failed to create tokenization cron jobs: {e}")
-    
+
     def migrate_genres_and_tags():
         """
         Add genres and tags columns to games table.

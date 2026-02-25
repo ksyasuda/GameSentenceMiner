@@ -6,10 +6,16 @@ const os = require('os');
 const net = require('net');
 const http = require('http');
 const https = require('https');
+const readline = require('readline');
 const WebSocket = require('ws');
 const bg = require('./background');
 const BackendConnector = require('./backend_connector');
 const { URL } = require('url');
+const BRIDGE_MODE = process.argv.includes('--bridge') || process.env.GSM_TOKENIZER_BRIDGE_MODE === '1';
+
+if (BRIDGE_MODE) {
+  console.log = (...args) => console.error(...args);
+}
 
 // FIX: Register chrome-extension protocol as privileged to allow image loading and CORS in renderer
 protocol.registerSchemesAsPrivileged([
@@ -25,9 +31,15 @@ protocol.registerSchemesAsPrivileged([
   }
 ]);
 
-let dataPath = process.env.APPDATA
-  ? path.join(process.env.APPDATA, "gsm_overlay") // Windows
-  : path.join(os.homedir(), '.config', "gsm_overlay"); // macOS/Linux
+const appDataBase = process.platform === 'win32'
+  ? (process.env.APPDATA || path.join(os.homedir(), '.config'))
+  : path.join(os.homedir(), '.config');
+const defaultDataPath = path.join(appDataBase, "gsm_overlay");
+const bridgeDataPathDefault = path.join(appDataBase, "GameSentenceMiner", "gsm_overlay_tokenizer_bridge");
+const bridgeDataPathOverride = String(process.env.GSM_TOKENIZER_BRIDGE_USER_DATA_DIR || "").trim();
+let dataPath = BRIDGE_MODE
+  ? (bridgeDataPathOverride || bridgeDataPathDefault)
+  : defaultDataPath;
 
 fs.mkdirSync(dataPath, { recursive: true });
 app.setPath('userData', dataPath);
@@ -598,18 +610,204 @@ function loadOverlayPage(win, relativePath) {
   return win.loadFile(relativePath);
 }
 
-async function loadExtension(name) {
-  const extDir = isDev ? path.join(__dirname, name) : path.join(process.resourcesPath, name);
+async function loadExtension(name, options = {}) {
+  let extDir = isDev ? path.join(__dirname, name) : path.join(process.resourcesPath, name);
+  if (BRIDGE_MODE && !fs.existsSync(path.join(extDir, 'manifest.json'))) {
+    const installedDir = path.join(appDataBase, 'gsm_overlay', 'extensions', name);
+    if (fs.existsSync(path.join(installedDir, 'manifest.json'))) {
+      extDir = installedDir;
+    }
+  }
   const extTargetDir = ensureExtensionCopy(name, extDir);
+  const manifestPath = path.join(extTargetDir, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    const message = `Extension manifest not found for ${name} at ${manifestPath}`;
+    if (options.strict) {
+      throw new Error(message);
+    }
+    console.error(message);
+    return null;
+  }
   try {
     const loadedExt = await session.defaultSession.loadExtension(extTargetDir, { allowFileAccess: true });
     console.log(`${name} extension loaded.`);
     console.log('Extension ID:', loadedExt.id);
     return loadedExt;
   } catch (e) {
+    if (options.strict) {
+      throw e;
+    }
     console.error(`Failed to load extension ${name}:`, e);
     return null;
   }
+}
+
+function writeBridgeMessage(message) {
+  try {
+    process.stdout.write(`${JSON.stringify(message)}\n`);
+  } catch (error) {
+    console.error('[Bridge] Failed to write response:', error);
+  }
+}
+
+async function invokeBridgeParseBatch(bridgeWindow, texts, scanLength) {
+  const script = `
+    (async () => {
+      const invoke = (action, params) => new Promise((resolve, reject) => {
+        try {
+          chrome.runtime.sendMessage({ action, params }, (response) => {
+            const runtimeError = chrome.runtime.lastError;
+            if (runtimeError) {
+              reject(new Error(runtimeError.message || String(runtimeError)));
+              return;
+            }
+            if (!response || typeof response !== 'object') {
+              reject(new Error('Unexpected response from extension backend'));
+              return;
+            }
+            if (typeof response.error !== 'undefined') {
+              const errorMessage = (response.error && response.error.message) || JSON.stringify(response.error);
+              reject(new Error(errorMessage || 'parseText failed'));
+              return;
+            }
+            resolve(response.result);
+          });
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      const optionsContext = { current: true };
+      const optionsFull = await invoke('optionsGetFull', void 0);
+      const profileIndex = Number(optionsFull?.profileCurrent ?? 0);
+      const defaultScanLength = Number(optionsFull?.profiles?.[profileIndex]?.options?.scanning?.length ?? 10);
+      const requestedScanLength = Number(${JSON.stringify(scanLength)});
+      const effectiveScanLength = Number.isFinite(requestedScanLength)
+        ? requestedScanLength
+        : defaultScanLength;
+
+      const inputTexts = ${JSON.stringify(texts)};
+      if (inputTexts.length === 0) {
+        return [];
+      }
+
+      let parsedBatch = null;
+      try {
+        parsedBatch = await invoke('parseText', {
+          text: inputTexts,
+          optionsContext,
+          scanLength: Math.max(1, effectiveScanLength),
+          useInternalParser: true,
+          useMecabParser: true
+        });
+      } catch (_error) {
+        return new Array(inputTexts.length).fill(null);
+      }
+
+      if (!Array.isArray(parsedBatch)) {
+        return new Array(inputTexts.length).fill(null);
+      }
+
+      const grouped = Array.from({ length: inputTexts.length }, () => []);
+      for (const entry of parsedBatch) {
+        const index = Number(entry?.index);
+        if (!Number.isFinite(index) || index < 0 || index >= inputTexts.length) {
+          continue;
+        }
+        grouped[index].push(entry);
+      }
+      return grouped.map((items) => (items.length > 0 ? items : null));
+    })();
+  `;
+  return bridgeWindow.webContents.executeJavaScript(script, true);
+}
+
+async function runBridgeMode() {
+  isDev = !app.isPackaged;
+  let bridgeWindow = null;
+  let bridgeReady = false;
+  let bridgeInitError = null;
+
+  const bridgeInitPromise = (async () => {
+    yomitanExt = await loadExtension('yomitan', { strict: true });
+    bridgeWindow = new BrowserWindow({
+      show: false,
+      width: 800,
+      height: 600,
+      webPreferences: {
+        contextIsolation: false,
+        nodeIntegration: false
+      }
+    });
+    await bridgeWindow.loadURL(`chrome-extension://${yomitanExt.id}/settings.html`);
+    await bridgeWindow.webContents.executeJavaScript('document.readyState', true);
+    bridgeReady = true;
+  })().catch((error) => {
+    bridgeInitError = String(error && error.message ? error.message : error);
+    console.error('[Bridge] Initialization failed:', error);
+    throw error;
+  });
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity
+  });
+
+  rl.on('line', async (line) => {
+    let request = null;
+    try {
+      request = JSON.parse(line);
+    } catch (_error) {
+      return;
+    }
+    if (!request || typeof request !== 'object') {
+      return;
+    }
+
+    const id = Number.isFinite(Number(request.id)) ? Number(request.id) : -1;
+    const method = String(request.method || '');
+    const params = request.params && typeof request.params === 'object' ? request.params : {};
+
+    try {
+      if (method === 'ping') {
+        writeBridgeMessage({
+          id,
+          ok: true,
+          result: {
+            ready: bridgeReady && !bridgeInitError,
+            initializing: !bridgeReady && !bridgeInitError,
+            error: bridgeInitError || null
+          }
+        });
+        return;
+      }
+      if (method === 'shutdown') {
+        writeBridgeMessage({ id, ok: true, result: { shuttingDown: true } });
+        app.quit();
+        return;
+      }
+      if (method === 'tokenize_batch') {
+        await bridgeInitPromise;
+        if (!bridgeWindow || bridgeInitError) {
+          throw new Error(bridgeInitError || 'Bridge window not ready');
+        }
+        const texts = Array.isArray(params.texts) ? params.texts.map((value) => String(value || '')) : [];
+        const scanLength = Number(params.scanLength);
+        const result = await invokeBridgeParseBatch(bridgeWindow, texts, scanLength);
+        writeBridgeMessage({ id, ok: true, result });
+        return;
+      }
+      writeBridgeMessage({ id, ok: false, error: `Unknown method: ${method}` });
+    } catch (error) {
+      writeBridgeMessage({ id, ok: false, error: String(error && error.message ? error.message : error) });
+    }
+  });
+
+  rl.on('close', () => {
+    app.quit();
+  });
+
+  await bridgeInitPromise;
 }
 
 function readExtensionVersions() {
@@ -636,7 +834,7 @@ function readExtensionPackageVersion(dirPath) {
     return null;
   }
   try {
-    const data = fs.readFileSync(pkgPath, 'utf-8');
+    const data = fs.readFileSync(pkgPath, 'utf-8').replace(/^\uFEFF/, '');
     const pkg = JSON.parse(data);
     return pkg && pkg.version ? String(pkg.version) : null;
   } catch (e) {
@@ -2118,6 +2316,10 @@ function updateTrayMenu() {
 
 
 app.whenReady().then(async () => {
+  if (BRIDGE_MODE) {
+    await runBridgeMode();
+    return;
+  }
 
   if (!isWindows()) {
     userSettings.manualMode = true; // enforce manual mode on non-Windows platforms
