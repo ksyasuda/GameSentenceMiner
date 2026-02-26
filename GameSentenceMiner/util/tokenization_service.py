@@ -153,8 +153,11 @@ class OverlayTokenizerBridgeClient:
     def __init__(self) -> None:
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        self._response_lock = threading.Lock()
+        self._pending_responses: Dict[int, "queue.Queue[Dict[str, Any]]"] = {}
         self._request_id = 0
         self._idle_timer: Optional[threading.Timer] = None
+        self._stdout_pump_thread: Optional[threading.Thread] = None
         self._stderr_pump_thread: Optional[threading.Thread] = None
         self.idle_timeout_seconds = int(
             os.environ.get(
@@ -298,6 +301,76 @@ class OverlayTokenizerBridgeClient:
         )
         self._stderr_pump_thread.start()
 
+    def _resolve_waiter(self, request_id: int) -> Optional["queue.Queue[Dict[str, Any]]"]:
+        with self._response_lock:
+            return self._pending_responses.get(request_id)
+
+    def _register_waiter(self, request_id: int) -> "queue.Queue[Dict[str, Any]]":
+        waiter: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1)
+        with self._response_lock:
+            self._pending_responses[request_id] = waiter
+        return waiter
+
+    def _unregister_waiter(self, request_id: int) -> None:
+        with self._response_lock:
+            self._pending_responses.pop(request_id, None)
+
+    def _fail_all_pending(self, error_message: str) -> None:
+        with self._response_lock:
+            pending = list(self._pending_responses.items())
+            self._pending_responses.clear()
+        for _request_id, waiter in pending:
+            try:
+                waiter.put_nowait({"ok": False, "error": error_message})
+            except Exception:
+                pass
+
+    def _start_stdout_pump(self) -> None:
+        if self._process is None or self._process.stdout is None:
+            return
+        if self._stdout_pump_thread is not None and self._stdout_pump_thread.is_alive():
+            return
+
+        proc = self._process
+        stdout = proc.stdout
+
+        def _pump() -> None:
+            error_message = "Bridge process closed stdout unexpectedly"
+            try:
+                for raw_line in iter(stdout.readline, ""):
+                    if not raw_line:
+                        break
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                    except Exception:
+                        logger.warning(f"Tokenizer bridge returned invalid JSON: {line[:200]}")
+                        continue
+                    try:
+                        request_id = int(parsed.get("id", -1))
+                    except Exception:
+                        continue
+                    waiter = self._resolve_waiter(request_id)
+                    if waiter is None:
+                        continue
+                    try:
+                        waiter.put_nowait(parsed)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                error_message = f"Bridge stdout reader failed: {exc}"
+            finally:
+                self._fail_all_pending(error_message)
+
+        self._stdout_pump_thread = threading.Thread(
+            target=_pump,
+            name="gsm-tokenizer-bridge-stdout",
+            daemon=True,
+        )
+        self._stdout_pump_thread.start()
+
     def _cancel_idle_timer(self) -> None:
         if self._idle_timer is not None:
             self._idle_timer.cancel()
@@ -331,27 +404,8 @@ class OverlayTokenizerBridgeClient:
         except Exception as exc:
             logger.warning(f"Failed to launch tokenizer bridge command={cmd} cwd={cwd}: {exc}")
             raise
+        self._start_stdout_pump()
         self._start_stderr_pump()
-
-    def _read_response_line(self, timeout: float) -> str:
-        assert self._process is not None and self._process.stdout is not None
-        line_queue: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=1)
-
-        def _reader() -> None:
-            try:
-                line_queue.put(self._process.stdout.readline())
-            except Exception:
-                line_queue.put(None)
-
-        reader_thread = threading.Thread(target=_reader, daemon=True)
-        reader_thread.start()
-        try:
-            line = line_queue.get(timeout=max(1.0, timeout))
-        except queue.Empty as exc:
-            raise TimeoutError("Timed out waiting for bridge response") from exc
-        if not line:
-            raise RuntimeError("Bridge process closed stdout unexpectedly")
-        return line
 
     def _invoke(self, method: str, params: Dict[str, Any], timeout: float) -> Any:
         self._ensure_started()
@@ -359,18 +413,20 @@ class OverlayTokenizerBridgeClient:
 
         self._request_id += 1
         request_id = self._request_id
+        waiter = self._register_waiter(request_id)
         payload = {"id": request_id, "method": method, "params": params}
-        self._process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        self._process.stdin.flush()
-
-        while True:
-            line = self._read_response_line(timeout)
-            parsed = json.loads(line)
-            if int(parsed.get("id", -1)) != request_id:
-                continue
+        try:
+            self._process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._process.stdin.flush()
+            try:
+                parsed = waiter.get(timeout=max(1.0, timeout))
+            except queue.Empty as exc:
+                raise TimeoutError("Timed out waiting for bridge response") from exc
             if not parsed.get("ok", False):
                 raise RuntimeError(str(parsed.get("error", "Unknown bridge error")))
             return parsed.get("result")
+        finally:
+            self._unregister_waiter(request_id)
 
     def is_available(self) -> bool:
         with self._lock:
@@ -405,8 +461,11 @@ class OverlayTokenizerBridgeClient:
             self._cancel_idle_timer()
             proc = self._process
             self._process = None
+            self._stdout_pump_thread = None
+            self._stderr_pump_thread = None
             if proc is None:
                 return
+            self._fail_all_pending("Bridge shutdown")
             try:
                 if proc.stdin is not None and proc.poll() is None:
                     proc.stdin.write(json.dumps({"id": -1, "method": "shutdown", "params": {}}) + "\n")
@@ -992,10 +1051,6 @@ def _realtime_worker() -> None:
         line_id, line_text, timestamp, game_id = item
         try:
             service = get_tokenization_service()
-            if service.is_backfill_session_active():
-                _realtime_queue.put(item)
-                time.sleep(0.5)
-                continue
             service.tokenize_lines_batch(
                 [(line_id, line_text, timestamp, game_id)]
             )

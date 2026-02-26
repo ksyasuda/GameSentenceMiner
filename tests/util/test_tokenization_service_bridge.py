@@ -1,4 +1,5 @@
 import importlib.util
+import queue
 import re
 import sys
 import types
@@ -31,10 +32,61 @@ def _load_tokenization_module(monkeypatch):
         _table = "dummy"
         _db = None
 
+    class _FakePattern:
+        def __init__(self, pattern: str):
+            self._pattern = pattern
+            self._fallback = None
+            try:
+                self._fallback = re.compile(pattern)
+            except Exception:
+                self._fallback = None
+
+        @staticmethod
+        def _is_japanese_char(ch: str) -> bool:
+            code = ord(ch)
+            return (
+                0x3040 <= code <= 0x309F  # Hiragana
+                or 0x30A0 <= code <= 0x30FF  # Katakana
+                or 0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs (Han)
+            )
+
+        @staticmethod
+        def _is_han(ch: str) -> bool:
+            code = ord(ch)
+            return 0x4E00 <= code <= 0x9FFF
+
+        def search(self, text: str):
+            text = str(text or "")
+            if "Script=Hiragana" in self._pattern or "Script=Katakana" in self._pattern:
+                return True if any(self._is_japanese_char(ch) for ch in text) else None
+            if self._fallback is not None:
+                return self._fallback.search(text)
+            return None
+
+        def findall(self, text: str):
+            text = str(text or "")
+            if self._pattern == r"\p{Han}":
+                return [ch for ch in text if self._is_han(ch)]
+            if self._fallback is not None:
+                return self._fallback.findall(text)
+            return []
+
+        def sub(self, repl: str, text: str):
+            text = str(text or "")
+            if self._fallback is not None:
+                return self._fallback.sub(repl, text)
+            return text
+
+    class _FakeRegexModule:
+        @staticmethod
+        def compile(pattern: str):
+            return _FakePattern(pattern)
+
     _stub_module(monkeypatch, "GameSentenceMiner")
     _stub_module(monkeypatch, "GameSentenceMiner.util")
     _stub_module(monkeypatch, "GameSentenceMiner.util.config")
     _stub_module(monkeypatch, "GameSentenceMiner.util.database")
+    _stub_module(monkeypatch, "regex", compile=_FakeRegexModule.compile)
     _stub_module(
         monkeypatch,
         "GameSentenceMiner.util.config.configuration",
@@ -159,7 +211,7 @@ def test_tokenize_lines_batch_uses_batch_persistence(monkeypatch):
     monkeypatch.setattr(
         service,
         "_tokenize_texts",
-        lambda texts: [
+        lambda texts, source="realtime": [
             [{"word": "学校", "headword": "学校", "reading": "ガッコウ"}] if text == "学校" else None
             for text in texts
         ],
@@ -185,6 +237,7 @@ def test_bridge_command_does_not_append_user_data_dir_flag(monkeypatch):
     monkeypatch.delenv("GSM_TOKENIZER_BRIDGE_CMD", raising=False)
     monkeypatch.setenv("GSM_OVERLAY_ELECTRON_BIN", "electron-custom")
     monkeypatch.setenv("GSM_TOKENIZER_BRIDGE_USER_DATA_DIR", "/tmp/gsm-bridge-profile")
+    monkeypatch.setattr(module.shutil, "which", lambda command: "/usr/bin/electron-custom" if command == "electron-custom" else None)
 
     client = OverlayTokenizerBridgeClient()
     cmd, _cwd = client._resolve_command()
@@ -200,6 +253,7 @@ def test_bridge_command_prefers_bridge_binary_env(monkeypatch):
     monkeypatch.delenv("GSM_TOKENIZER_BRIDGE_CMD", raising=False)
     monkeypatch.setenv("GSM_TOKENIZER_BRIDGE_BIN", "/tmp/gsm_overlay_bin")
     monkeypatch.setenv("GSM_OVERLAY_ELECTRON_BIN", "electron-custom")
+    monkeypatch.setattr(module.shutil, "which", lambda command: "/tmp/gsm_overlay_bin" if command == "/tmp/gsm_overlay_bin" else None)
 
     client = OverlayTokenizerBridgeClient()
     cmd, _cwd = client._resolve_command()
@@ -208,3 +262,29 @@ def test_bridge_command_prefers_bridge_binary_env(monkeypatch):
         "/tmp/gsm_overlay_bin",
         "--bridge",
     ]
+
+
+def test_realtime_worker_processes_lines_even_during_backfill(monkeypatch):
+    module = _load_tokenization_module(monkeypatch)
+
+    class _Service:
+        def __init__(self):
+            self.calls = []
+
+        def is_backfill_session_active(self):
+            return True
+
+        def tokenize_lines_batch(self, rows):
+            self.calls.append(rows)
+            return {"processed": len(rows), "failed": 0}
+
+    service = _Service()
+    monkeypatch.setattr(module, "get_tokenization_service", lambda: service)
+    monkeypatch.setattr(module, "_realtime_queue", queue.Queue())
+
+    module._realtime_queue.put(("line_1", "学校", 1700000000.0, "game_1"))
+    module._realtime_queue.put(None)
+    module._realtime_worker()
+
+    assert len(service.calls) == 1
+    assert service.calls[0] == [("line_1", "学校", 1700000000.0, "game_1")]

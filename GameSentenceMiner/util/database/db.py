@@ -1152,6 +1152,13 @@ class GameLinesTable(SQLiteDBTable):
         """
         if not line_id:
             return
+        try:
+            from GameSentenceMiner.util.tokenization_service import (
+                get_tokenization_service,
+            )
+            get_tokenization_service().remove_line_occurrences(line_id)
+        except Exception as e:
+            logger.warning(f"Tokenization occurrence cleanup failed for line {line_id}: {e}")
         cls._db.execute(
             f"DELETE FROM {cls._table} WHERE id=?",
             (line_id,),

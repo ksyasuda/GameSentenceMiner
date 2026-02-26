@@ -622,7 +622,7 @@ function runGSM(command: string, args: string[]): Promise<void> {
                 isWindows() ? 'electron.cmd' : 'electron'
             );
             if (fs.existsSync(overlayDevElectronPath)) {
-                childEnv.GSM_TOKENIZER_BRIDGE_BIN = overlayDevElectronPath;
+                childEnv.GSM_OVERLAY_ELECTRON_BIN = overlayDevElectronPath;
             }
         }
         childEnv.GSM_TOKENIZER_BRIDGE_USER_DATA_DIR = path.join(BASE_DIR, 'gsm_overlay_tokenizer_bridge');

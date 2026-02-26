@@ -174,7 +174,7 @@ def test_extract_tokens_parses_yomitan_scan_segments() -> None:
             "content": [
                 [{"text": "そうかあ", "reading": ""}],
                 [
-                    {"text": "レイプ", "reading": "レイプ", "headwords": [[{"term": "レイプ", "reading": "レイプ", "sources": []}]},
+                    {"text": "レイプ", "reading": "レイプ", "headwords": [[{"term": "レイプ", "reading": "レイプ", "sources": []}]]},
                 ],
                 [{"text": "目", "reading": "め"}],
             ],
