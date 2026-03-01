@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the tokenization backfill job directly (outside the cron scheduler)."""
+"""Run tokenization catchup directly."""
 
 import argparse
 import sys
@@ -36,7 +36,7 @@ def _configure_db_override(db_path: str) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run tokenization backfill directly (outside cron scheduler)"
+        description="Run tokenization catchup directly"
     )
     parser.add_argument(
         "--db-path",
@@ -53,6 +53,8 @@ def main(argv=None) -> int:
 
     start = time.perf_counter()
     result = backfill_tokenization()
+    if not isinstance(result, dict):
+        result = {"success": False, "total": 0, "processed": 0, "failed": 0, "completed": 0}
     elapsed = time.perf_counter() - start
 
     total = int(result.get("total", 0))
@@ -63,7 +65,7 @@ def main(argv=None) -> int:
     success = bool(result.get("success", False))
 
     print(f"\n{'=' * 50}")
-    print(f"Backfill complete in {elapsed:.1f}s")
+    print(f"Tokenization catchup complete in {elapsed:.1f}s")
     print(f"  total:     {total}")
     print(f"  processed: {processed}")
     print(f"  failed:    {failed}")
