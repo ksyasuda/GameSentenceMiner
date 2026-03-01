@@ -82,24 +82,21 @@ class SQLiteDB:
                 # If SQLite already has an open implicit transaction on this connection,
                 # adopt it instead of issuing BEGIN again.
                 if not conn.in_transaction:
-                    conn.execute("BEGIN")
+                    conn.execute("BEGIN IMMEDIATE")
             self._local.tx_depth = tx_depth + 1
 
-        try:
-            yield conn
-        except Exception:
-            with self._lock:
-                tx_depth = max(getattr(self._local, "tx_depth", 1) - 1, 0)
-                self._local.tx_depth = tx_depth
-                if tx_depth == 0:
-                    conn.rollback()
-            raise
-        else:
-            with self._lock:
+            try:
+                yield conn
                 tx_depth = max(getattr(self._local, "tx_depth", 1) - 1, 0)
                 self._local.tx_depth = tx_depth
                 if tx_depth == 0:
                     conn.commit()
+            except Exception:
+                tx_depth = max(getattr(self._local, "tx_depth", 1) - 1, 0)
+                self._local.tx_depth = tx_depth
+                if tx_depth == 0:
+                    conn.rollback()
+                raise
 
     def delete_where_in(
         self,
