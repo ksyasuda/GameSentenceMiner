@@ -17,8 +17,6 @@ import {
     BASE_DIR,
     execFileAsync,
     getAssetsDir,
-    getOverlayExecName,
-    getOverlayPath,
     getResourcesDir,
     getRendererEntryPath,
     getSecureWebPreferences,
@@ -647,23 +645,6 @@ function runGSM(command: string, args: string[]): Promise<void> {
     return new Promise((resolve, reject) => {
         const taskManagerCommand = getWindowsNamedPythonExecutable(command, APP_NAME);
         const childEnv: NodeJS.ProcessEnv = { ...getSanitizedPythonEnv(), GSM_ELECTRON: '1' };
-        const overlayExecPath = path.join(getOverlayPath(), getOverlayExecName());
-        if (fs.existsSync(overlayExecPath)) {
-            childEnv.GSM_TOKENIZER_BRIDGE_BIN = overlayExecPath;
-        } else {
-            const overlayDevElectronPath = path.join(
-                __dirname,
-                '..',
-                '..',
-                'node_modules',
-                '.bin',
-                isWindows() ? 'electron.cmd' : 'electron'
-            );
-            if (fs.existsSync(overlayDevElectronPath)) {
-                childEnv.GSM_TOKENIZER_BRIDGE_BIN = overlayDevElectronPath;
-            }
-        }
-        childEnv.GSM_TOKENIZER_BRIDGE_USER_DATA_DIR = path.join(BASE_DIR, 'gsm_overlay_tokenizer_bridge');
         const proc = spawn(taskManagerCommand, args, {
             env: childEnv
         });

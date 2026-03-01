@@ -2,6 +2,7 @@ import { BrowserWindow, session, screen, globalShortcut, dialog, ipcMain, app } 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as http from 'http';
 import { getResourcesDir, isDev } from '../util.js';
 import { fileURLToPath } from 'url';
 
@@ -28,6 +29,9 @@ async function loadOverlayDependencies() {
 let overlayWindow: BrowserWindow | null = null;
 let settingsWindow: BrowserWindow | null = null;
 let yomitanSettingsWindow: BrowserWindow | null = null;
+let yomitanApiBridgeWindow: BrowserWindow | null = null;
+let yomitanApiBridgeReadyPromise: Promise<BrowserWindow> | null = null;
+let yomitanApiServer: http.Server | null = null;
 let ext: any = null;
 let overlayInitialized = false;
 
@@ -46,6 +50,73 @@ let websocketStates = {
     ws1: false,
     ws2: false,
 };
+const EMBEDDED_YOMITAN_API_ADDR = '127.0.0.1';
+const EMBEDDED_YOMITAN_API_PORT = 19633;
+const EMBEDDED_YOMITAN_API_VERSION = 1;
+const YOMITAN_API_UNAVAILABLE_CODE = 'YOMITAN_API_UNAVAILABLE';
+const DEFAULT_YOMITAN_API_UNAVAILABLE_ERROR = 'Yomitan extension API unavailable';
+
+type YomitanApiAvailabilityState = {
+    ready: boolean;
+    error: string | null;
+};
+
+function normalizeYomitanApiError(error: unknown): string {
+    if (error instanceof Error && error.message) {
+        return error.message;
+    }
+    if (typeof error === 'string' && error.trim()) {
+        return error.trim();
+    }
+    return DEFAULT_YOMITAN_API_UNAVAILABLE_ERROR;
+}
+
+function createYomitanApiAvailabilityState(): YomitanApiAvailabilityState {
+    return {
+        ready: false,
+        error: DEFAULT_YOMITAN_API_UNAVAILABLE_ERROR,
+    };
+}
+
+function markYomitanApiReady(): YomitanApiAvailabilityState {
+    return {
+        ready: true,
+        error: null,
+    };
+}
+
+function markYomitanApiUnavailable(error: unknown): YomitanApiAvailabilityState {
+    return {
+        ready: false,
+        error: normalizeYomitanApiError(error),
+    };
+}
+
+function getServerVersionResponse(state: YomitanApiAvailabilityState, version: number) {
+    if (state.ready) {
+        return {
+            statusCode: 200,
+            payload: { version },
+        };
+    }
+    return {
+        statusCode: 503,
+        payload: {
+            error: normalizeYomitanApiError(state.error),
+        },
+    };
+}
+
+function ensureYomitanApiAvailable(state: YomitanApiAvailabilityState): void {
+    if (state.ready) {
+        return;
+    }
+    const error = new Error(normalizeYomitanApiError(state.error));
+    (error as Error & { code?: string }).code = YOMITAN_API_UNAVAILABLE_CODE;
+    throw error;
+}
+
+let yomitanApiAvailabilityState: YomitanApiAvailabilityState = createYomitanApiAvailabilityState();
 
 // Paths and settings
 const dataPath = path.join(process.env.APPDATA || path.join(os.homedir(), '.config'), 'gsm_overlay');
@@ -116,6 +187,249 @@ function getGSMOverlaySettings() {
 function getCurrentOverlayMonitor() {
     const overlaySettings = getGSMOverlaySettings();
     return screen.getAllDisplays()[overlaySettings.monitor_to_capture] || screen.getPrimaryDisplay();
+}
+
+function sendJsonResponse(response: http.ServerResponse, statusCode: number, payload: unknown) {
+    response.writeHead(statusCode, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': '*',
+        'Access-Control-Allow-Headers': '*',
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+    });
+    response.end(JSON.stringify(payload));
+}
+
+function readJsonBody(request: http.IncomingMessage): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+        let body = '';
+        request.setEncoding('utf8');
+        request.on('data', (chunk: string) => {
+            body += chunk;
+        });
+        request.on('end', () => {
+            if (!body.trim()) {
+                resolve({});
+                return;
+            }
+            try {
+                resolve(JSON.parse(body) as Record<string, unknown>);
+            } catch (_error) {
+                reject(new Error('Invalid request body'));
+            }
+        });
+        request.on('error', reject);
+    });
+}
+
+function markEmbeddedYomitanApiReady() {
+    yomitanApiAvailabilityState = markYomitanApiReady();
+}
+
+function markEmbeddedYomitanApiUnavailable(error: unknown) {
+    yomitanApiAvailabilityState = markYomitanApiUnavailable(error);
+}
+
+async function ensureYomitanApiBridgeWindow(): Promise<BrowserWindow> {
+    if (yomitanApiBridgeWindow && !yomitanApiBridgeWindow.isDestroyed()) {
+        return yomitanApiBridgeWindow;
+    }
+    if (yomitanApiBridgeReadyPromise) {
+        return yomitanApiBridgeReadyPromise;
+    }
+
+    yomitanApiBridgeReadyPromise = (async () => {
+        if (!ext || !ext.id) {
+            const error = new Error('Yomitan extension is not loaded');
+            markEmbeddedYomitanApiUnavailable(error);
+            throw error;
+        }
+        const bridgeWindow = new BrowserWindow({
+            show: false,
+            width: 800,
+            height: 600,
+            webPreferences: {
+                contextIsolation: false,
+                nodeIntegration: false,
+            },
+        });
+        await bridgeWindow.loadURL(`chrome-extension://${ext.id}/gsm-api-bridge.html`);
+        await bridgeWindow.webContents.executeJavaScript('document.readyState', true);
+        bridgeWindow.on('closed', () => {
+            if (yomitanApiBridgeWindow === bridgeWindow) {
+                yomitanApiBridgeWindow = null;
+            }
+            yomitanApiBridgeReadyPromise = null;
+            markEmbeddedYomitanApiUnavailable('Yomitan API bridge window closed');
+        });
+        yomitanApiBridgeWindow = bridgeWindow;
+        markEmbeddedYomitanApiReady();
+        return bridgeWindow;
+    })();
+
+    try {
+        return await yomitanApiBridgeReadyPromise;
+    } catch (error) {
+        yomitanApiBridgeReadyPromise = null;
+        markEmbeddedYomitanApiUnavailable(error);
+        throw error;
+    }
+}
+
+async function invokeYomitanExtensionApi(action: string, params: unknown): Promise<unknown> {
+    const bridgeWindow = await ensureYomitanApiBridgeWindow();
+    const script = `
+      (async () => {
+        const invoke = (action, params) => new Promise((resolve, reject) => {
+          try {
+            chrome.runtime.sendMessage({ action, params }, (response) => {
+              const runtimeError = chrome.runtime.lastError;
+              if (runtimeError) {
+                reject(new Error(runtimeError.message || String(runtimeError)));
+                return;
+              }
+              if (!response || typeof response !== 'object') {
+                reject(new Error('Unexpected response from extension backend'));
+                return;
+              }
+              if (typeof response.error !== 'undefined') {
+                const errorMessage = (response.error && response.error.message) || JSON.stringify(response.error);
+                reject(new Error(errorMessage || 'Extension API call failed'));
+                return;
+              }
+              resolve(response.result);
+            });
+          } catch (error) {
+            reject(error);
+          }
+        });
+
+        return await invoke(${JSON.stringify(action)}, ${JSON.stringify(params)});
+      })();
+    `;
+    try {
+        const result = await bridgeWindow.webContents.executeJavaScript(script, true);
+        markEmbeddedYomitanApiReady();
+        return result;
+    } catch (error) {
+        markEmbeddedYomitanApiUnavailable(error);
+        throw error;
+    }
+}
+
+async function startEmbeddedYomitanApiServer() {
+    if (yomitanApiServer !== null) {
+        return;
+    }
+
+    if (!ext || !ext.id) {
+        markEmbeddedYomitanApiUnavailable('Yomitan extension is not loaded');
+    } else {
+        try {
+            await ensureYomitanApiBridgeWindow();
+            markEmbeddedYomitanApiReady();
+        } catch (error) {
+            markEmbeddedYomitanApiUnavailable(error);
+            console.warn('[YomitanAPI] Bridge warmup failed; readiness probe will report unavailable:', error);
+        }
+    }
+
+    const handler = async (request: http.IncomingMessage, response: http.ServerResponse) => {
+        try {
+            if (request.method !== 'POST') {
+                response.writeHead(405, { Allow: 'POST' });
+                response.end();
+                return;
+            }
+
+            const urlObj = new URL(
+                request.url || '/',
+                `http://${EMBEDDED_YOMITAN_API_ADDR}:${EMBEDDED_YOMITAN_API_PORT}`
+            );
+            const pathName = urlObj.pathname.replace(/^\/+/, '');
+
+            if (pathName === '' || pathName === 'serverVersion') {
+                const serverVersion = getServerVersionResponse(
+                    yomitanApiAvailabilityState,
+                    EMBEDDED_YOMITAN_API_VERSION
+                );
+                sendJsonResponse(response, serverVersion.statusCode, serverVersion.payload);
+                return;
+            }
+
+            ensureYomitanApiAvailable(yomitanApiAvailabilityState);
+
+            const body = await readJsonBody(request);
+            const optionsContext = { current: true };
+
+            switch (pathName) {
+                case 'tokenize': {
+                    const text = body.text;
+                    const scanLength = Number(body.scanLength);
+                    if (typeof text !== 'string' && !Array.isArray(text)) {
+                        throw new Error(
+                            'Invalid input for tokenize, expected "text" to be a string or a string array'
+                        );
+                    }
+                    if (!Number.isFinite(scanLength)) {
+                        throw new Error('Invalid input for tokenize, expected "scanLength" to be a number');
+                    }
+                    const result = await invokeYomitanExtensionApi('parseText', {
+                        text,
+                        optionsContext,
+                        scanLength: Math.max(1, scanLength),
+                        useInternalParser: true,
+                        useMecabParser: false,
+                    });
+                    sendJsonResponse(response, 200, result);
+                    return;
+                }
+                case 'termEntries': {
+                    const term = typeof body.term === 'string' ? body.term : '';
+                    const result = await invokeYomitanExtensionApi('termsFind', {
+                        text: term,
+                        details: {},
+                        optionsContext,
+                    });
+                    sendJsonResponse(response, 200, result);
+                    return;
+                }
+                case 'kanjiEntries': {
+                    const character = typeof body.character === 'string' ? body.character : '';
+                    const result = await invokeYomitanExtensionApi('kanjiFind', {
+                        text: character,
+                        details: {},
+                        optionsContext,
+                    });
+                    sendJsonResponse(response, 200, result);
+                    return;
+                }
+                default:
+                    sendJsonResponse(response, 400, { error: `Unsupported action: ${pathName}` });
+            }
+        } catch (error) {
+            const knownError = error as Error & { code?: string };
+            const statusCode = knownError.code === YOMITAN_API_UNAVAILABLE_CODE ? 503 : 500;
+            sendJsonResponse(response, statusCode, {
+                error: String(knownError && knownError.message ? knownError.message : knownError),
+            });
+        }
+    };
+
+    yomitanApiServer = http.createServer((request, response) => {
+        void handler(request, response);
+    });
+
+    await new Promise<void>((resolve, reject) => {
+        yomitanApiServer!.once('error', reject);
+        yomitanApiServer!.listen(EMBEDDED_YOMITAN_API_PORT, EMBEDDED_YOMITAN_API_ADDR, () => {
+            yomitanApiServer!.off('error', reject);
+            console.log(
+                `[YomitanAPI] Embedded server running at http://${EMBEDDED_YOMITAN_API_ADDR}:${EMBEDDED_YOMITAN_API_PORT}`
+            );
+            resolve();
+        });
+    });
 }
 
 function saveSettings() {
@@ -274,7 +588,6 @@ async function initializeYomitan() {
     }
 
     try {
-        // Load extension using the standard API
         ext = await session.defaultSession.loadExtension(yomitanDir, { allowFileAccess: true });
         console.log('Yomitan extension loaded.');
         console.log('Extension ID:', ext.id);
@@ -288,6 +601,13 @@ async function initializeYomitan() {
         }
     } catch (e) {
         console.error('Failed to load Yomitan extension:', e);
+        return;
+    }
+
+    try {
+        await startEmbeddedYomitanApiServer();
+    } catch (error) {
+        console.error('[YomitanAPI] Failed to start embedded API server:', error);
     }
 }
 
@@ -604,6 +924,20 @@ function setupOverlayIPC() {
         if (activityTimer) {
             clearTimeout(activityTimer);
         }
+        if (yomitanApiServer) {
+            try {
+                yomitanApiServer.close();
+            } catch (error) {
+                console.warn('[YomitanAPI] Failed closing embedded server:', error);
+            }
+            yomitanApiServer = null;
+        }
+        if (yomitanApiBridgeWindow && !yomitanApiBridgeWindow.isDestroyed()) {
+            yomitanApiBridgeWindow.destroy();
+            yomitanApiBridgeWindow = null;
+        }
+        yomitanApiBridgeReadyPromise = null;
+        markEmbeddedYomitanApiUnavailable('App is quitting');
         saveSettings();
     });
 }

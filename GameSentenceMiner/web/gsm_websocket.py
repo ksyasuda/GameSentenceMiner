@@ -3,6 +3,7 @@ import json
 import queue
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Set
 
@@ -30,6 +31,37 @@ ID_PLAINTEXT_LEGACY = "plaintext_legacy"
 WS_PATH_HOOKER = "/ws/texthooker"
 WS_PATH_OVERLAY = "/ws/overlay"
 WS_PATH_PLAINTEXT = "/ws/plaintext"
+
+_OVERLAY_TOKENIZATION_TRIGGER_COOLDOWN_SECONDS = 10.0
+_last_overlay_tokenization_trigger_ts = 0.0
+
+
+def _trigger_daily_tokenization_on_overlay_connect() -> None:
+    global _last_overlay_tokenization_trigger_ts
+    now = time.time()
+    if (now - _last_overlay_tokenization_trigger_ts) < _OVERLAY_TOKENIZATION_TRIGGER_COOLDOWN_SECONDS:
+        return
+
+    _last_overlay_tokenization_trigger_ts = now
+
+    def _run_backfill() -> None:
+        try:
+            from GameSentenceMiner.util.cron.backfill_tokenization import backfill_tokenization
+
+            result = backfill_tokenization()
+            logger.info(f"Tokenization backfill finished after overlay websocket connect: {result}")
+        except Exception as error:
+            logger.warning(f"Failed to run tokenization backfill on overlay connect: {error}")
+
+    try:
+        threading.Thread(
+            target=_run_backfill,
+            daemon=True,
+            name="overlay-tokenization-backfill",
+        ).start()
+        logger.info("Started tokenization backfill after overlay websocket connect.")
+    except Exception as error:
+        logger.warning(f"Failed to start tokenization backfill thread on overlay connect: {error}")
 
 
 def _normalize_ws_path(path: Optional[str]) -> str:
@@ -197,6 +229,8 @@ class WebsocketServerThread(_PortConflictSupport, threading.Thread):
     async def _handler(self, websocket):
         self.clients.add(websocket)
         logger.debug(f"[{self.server_name}] Client connected. Total: {len(self.clients)}")
+        if self.server_name in {ID_OVERLAY, ID_OVERLAY_LEGACY}:
+            _trigger_daily_tokenization_on_overlay_connect()
 
         try:
             if self.backedup_text:
@@ -379,6 +413,8 @@ class MultiplexWebsocketServerThread(_PortConflictSupport, threading.Thread):
             f"[{self.server_name}] Client connected on '{server_id}'. "
             f"Total for endpoint: {len(clients)}"
         )
+        if server_id == ID_OVERLAY:
+            _trigger_daily_tokenization_on_overlay_connect()
 
         try:
             backup = self._get_backup(server_id)

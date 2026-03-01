@@ -2,12 +2,34 @@
 Tokenization backfill job.
 """
 
+import os
 import time
 
 from GameSentenceMiner.util.config.configuration import logger
 
 TOKENIZED_PENDING = 0
 TOKENIZED_RETRYABLE_FAILED = 2
+
+
+def _is_database_locked_error(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _run_with_db_lock_retry(fn, operation_name: str):
+    max_attempts = 12
+    delay_seconds = 0.08
+    max_delay_seconds = 0.6
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_database_locked_error(exc) or attempt >= max_attempts:
+                raise
+            logger.warning(
+                f"Backfill DB lock during {operation_name}, retrying attempt {attempt + 1}/{max_attempts}."
+            )
+            time.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2, max_delay_seconds)
 
 
 def _format_duration(seconds: float) -> str:
@@ -24,16 +46,22 @@ def _format_duration(seconds: float) -> str:
 def backfill_tokenization():
     from GameSentenceMiner.util.database.db import GameLinesTable
     from GameSentenceMiner.util.tokenization_service import \
-        get_tokenization_service
+        get_tokenization_service, has_pending_realtime_work
 
     # Retryable failures are deferred to later runs; requeue them at run start.
-    GameLinesTable._db.execute(f"""
-        UPDATE {GameLinesTable._table}
-        SET tokenized = {TOKENIZED_PENDING}
-        WHERE COALESCE(tokenized, {TOKENIZED_PENDING}) = {TOKENIZED_RETRYABLE_FAILED}
-            AND line_text IS NOT NULL
-            AND TRIM(line_text) != ''
-        """, commit=True)
+    _run_with_db_lock_retry(
+        lambda: GameLinesTable._db.execute(
+            f"""
+            UPDATE {GameLinesTable._table}
+            SET tokenized = {TOKENIZED_PENDING}
+            WHERE COALESCE(tokenized, {TOKENIZED_PENDING}) = {TOKENIZED_RETRYABLE_FAILED}
+                AND line_text IS NOT NULL
+                AND TRIM(line_text) != ''
+            """,
+            commit=True,
+        ),
+        "retryable-failure reset",
+    )
 
     total_row = GameLinesTable._db.fetchone(f"""
         SELECT COUNT(*)
@@ -78,11 +106,15 @@ def backfill_tokenization():
         failed = 0
         completed = 0
         batch_number = 0
-        batch_size = 2000
+        batch_size = max(25, int(os.environ.get("GSM_TOKENIZER_BACKFILL_BATCH_SIZE", "1000")))
         next_progress_milestone = batch_size
         start_time = time.perf_counter()
+        realtime_yield_sleep_seconds = 0.05
 
         while True:
+            while has_pending_realtime_work():
+                time.sleep(realtime_yield_sleep_seconds)
+
             batch_number += 1
             rows = GameLinesTable._db.fetchall(f"""
                 SELECT id, line_text, timestamp, game_id

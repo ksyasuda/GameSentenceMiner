@@ -6,16 +6,18 @@ const os = require('os');
 const net = require('net');
 const http = require('http');
 const https = require('https');
-const readline = require('readline');
 const WebSocket = require('ws');
 const bg = require('./background');
 const BackendConnector = require('./backend_connector');
 const { URL } = require('url');
-const BRIDGE_MODE = process.argv.includes('--bridge') || process.env.GSM_TOKENIZER_BRIDGE_MODE === '1';
-
-if (BRIDGE_MODE) {
-  console.log = (...args) => console.error(...args);
-}
+const {
+  YOMITAN_API_UNAVAILABLE_CODE,
+  createYomitanApiAvailabilityState,
+  markYomitanApiReady: buildYomitanApiReadyState,
+  markYomitanApiUnavailable: buildYomitanApiUnavailableState,
+  getServerVersionResponse,
+  ensureYomitanApiAvailable,
+} = require('./yomitan_api_readiness');
 
 // FIX: Register chrome-extension protocol as privileged to allow image loading and CORS in renderer
 protocol.registerSchemesAsPrivileged([
@@ -35,11 +37,7 @@ const appDataBase = process.platform === 'win32'
   ? (process.env.APPDATA || path.join(os.homedir(), '.config'))
   : path.join(os.homedir(), '.config');
 const defaultDataPath = path.join(appDataBase, "gsm_overlay");
-const bridgeDataPathDefault = path.join(appDataBase, "GameSentenceMiner", "gsm_overlay_tokenizer_bridge");
-const bridgeDataPathOverride = String(process.env.GSM_TOKENIZER_BRIDGE_USER_DATA_DIR || "").trim();
-let dataPath = BRIDGE_MODE
-  ? (bridgeDataPathOverride || bridgeDataPathDefault)
-  : defaultDataPath;
+let dataPath = defaultDataPath;
 
 fs.mkdirSync(dataPath, { recursive: true });
 app.setPath('userData', dataPath);
@@ -301,6 +299,10 @@ let jitenReaderSettingsWindow = null;
 let settingsWindow = null;
 let offsetHelperWindow = null;
 let texthookerWindow = null;
+let yomitanApiBridgeWindow = null;
+let yomitanApiBridgeReadyPromise = null;
+let yomitanApiServer = null;
+let yomitanApiAvailabilityState = createYomitanApiAvailabilityState();
 let texthookerLoadToken = 0;
 let tray = null;
 let platformOverride = null;
@@ -313,6 +315,9 @@ const overlayWebSockets = {
   ws1: { socket: null, url: null, reconnectTimer: null },
   ws2: { socket: null, url: null, reconnectTimer: null },
 };
+const EMBEDDED_YOMITAN_API_ADDR = '127.0.0.1';
+const EMBEDDED_YOMITAN_API_PORT = 19633;
+const EMBEDDED_YOMITAN_API_VERSION = 1;
 
 function publishOverlaySocketState(type, isOpen) {
   websocketStates[type] = !!isOpen;
@@ -611,13 +616,7 @@ function loadOverlayPage(win, relativePath) {
 }
 
 async function loadExtension(name, options = {}) {
-  let extDir = isDev ? path.join(__dirname, name) : path.join(process.resourcesPath, name);
-  if (BRIDGE_MODE && !fs.existsSync(path.join(extDir, 'manifest.json'))) {
-    const installedDir = path.join(appDataBase, 'gsm_overlay', 'extensions', name);
-    if (fs.existsSync(path.join(installedDir, 'manifest.json'))) {
-      extDir = installedDir;
-    }
-  }
+  const extDir = isDev ? path.join(__dirname, name) : path.join(process.resourcesPath, name);
   const extTargetDir = ensureExtensionCopy(name, extDir);
   const manifestPath = path.join(extTargetDir, 'manifest.json');
   if (!fs.existsSync(manifestPath)) {
@@ -642,15 +641,96 @@ async function loadExtension(name, options = {}) {
   }
 }
 
-function writeBridgeMessage(message) {
+
+function sendJsonResponse(response, statusCode, payload) {
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': '*',
+    'Access-Control-Allow-Headers': '*',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+  });
+  response.end(JSON.stringify(payload));
+}
+
+function readJsonBody(request) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      if (!body.trim()) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch (error) {
+        reject(new Error('Invalid request body'));
+      }
+    });
+    request.on('error', reject);
+  });
+}
+
+function markEmbeddedYomitanApiReady() {
+  yomitanApiAvailabilityState = buildYomitanApiReadyState(yomitanApiAvailabilityState);
+}
+
+function markEmbeddedYomitanApiUnavailable(error) {
+  yomitanApiAvailabilityState = buildYomitanApiUnavailableState(yomitanApiAvailabilityState, error);
+}
+
+async function ensureYomitanApiBridgeWindow() {
+  if (yomitanApiBridgeWindow && !yomitanApiBridgeWindow.isDestroyed()) {
+    return yomitanApiBridgeWindow;
+  }
+  if (yomitanApiBridgeReadyPromise) {
+    return yomitanApiBridgeReadyPromise;
+  }
+
+  yomitanApiBridgeReadyPromise = (async () => {
+    if (!yomitanExt || !yomitanExt.id) {
+      const error = new Error('Yomitan extension is not loaded');
+      markEmbeddedYomitanApiUnavailable(error);
+      throw error;
+    }
+    const bridgeWindow = new BrowserWindow({
+      show: false,
+      width: 800,
+      height: 600,
+      webPreferences: {
+        contextIsolation: false,
+        nodeIntegration: false,
+      },
+    });
+    await bridgeWindow.loadURL(`chrome-extension://${yomitanExt.id}/gsm-api-bridge.html`);
+    await bridgeWindow.webContents.executeJavaScript('document.readyState', true);
+    bridgeWindow.on('closed', () => {
+      if (yomitanApiBridgeWindow === bridgeWindow) {
+        yomitanApiBridgeWindow = null;
+      }
+      yomitanApiBridgeReadyPromise = null;
+      markEmbeddedYomitanApiUnavailable('Yomitan API bridge window closed');
+    });
+    yomitanApiBridgeWindow = bridgeWindow;
+    markEmbeddedYomitanApiReady();
+    return bridgeWindow;
+  })();
+
   try {
-    process.stdout.write(`${JSON.stringify(message)}\n`);
+    return await yomitanApiBridgeReadyPromise;
   } catch (error) {
-    console.error('[Bridge] Failed to write response:', error);
+    yomitanApiBridgeReadyPromise = null;
+    markEmbeddedYomitanApiUnavailable(error);
+    throw error;
   }
 }
 
-async function invokeBridgeParseBatch(bridgeWindow, texts, scanLength) {
+async function invokeYomitanExtensionApi(action, params) {
+  const bridgeWindow = await ensureYomitanApiBridgeWindow();
   const script = `
     (async () => {
       const invoke = (action, params) => new Promise((resolve, reject) => {
@@ -667,7 +747,7 @@ async function invokeBridgeParseBatch(bridgeWindow, texts, scanLength) {
             }
             if (typeof response.error !== 'undefined') {
               const errorMessage = (response.error && response.error.message) || JSON.stringify(response.error);
-              reject(new Error(errorMessage || 'parseText failed'));
+              reject(new Error(errorMessage || 'Extension API call failed'));
               return;
             }
             resolve(response.result);
@@ -677,137 +757,119 @@ async function invokeBridgeParseBatch(bridgeWindow, texts, scanLength) {
         }
       });
 
-      const optionsContext = { current: true };
-      const optionsFull = await invoke('optionsGetFull', void 0);
-      const profileIndex = Number(optionsFull?.profileCurrent ?? 0);
-      const defaultScanLength = Number(optionsFull?.profiles?.[profileIndex]?.options?.scanning?.length ?? 10);
-      const requestedScanLength = Number(${JSON.stringify(scanLength)});
-      const effectiveScanLength = Number.isFinite(requestedScanLength)
-        ? requestedScanLength
-        : defaultScanLength;
-
-      const inputTexts = ${JSON.stringify(texts)};
-      if (inputTexts.length === 0) {
-        return [];
-      }
-
-      let parsedBatch = null;
-      try {
-        parsedBatch = await invoke('parseText', {
-          text: inputTexts,
-          optionsContext,
-          scanLength: Math.max(1, effectiveScanLength),
-          useInternalParser: true,
-          useMecabParser: true
-        });
-      } catch (_error) {
-        return new Array(inputTexts.length).fill(null);
-      }
-
-      if (!Array.isArray(parsedBatch)) {
-        return new Array(inputTexts.length).fill(null);
-      }
-
-      const grouped = Array.from({ length: inputTexts.length }, () => []);
-      for (const entry of parsedBatch) {
-        const index = Number(entry?.index);
-        if (!Number.isFinite(index) || index < 0 || index >= inputTexts.length) {
-          continue;
-        }
-        grouped[index].push(entry);
-      }
-      return grouped.map((items) => (items.length > 0 ? items : null));
+      return await invoke(${JSON.stringify(action)}, ${JSON.stringify(params)});
     })();
   `;
-  return bridgeWindow.webContents.executeJavaScript(script, true);
+  try {
+    const result = await bridgeWindow.webContents.executeJavaScript(script, true);
+    markEmbeddedYomitanApiReady();
+    return result;
+  } catch (error) {
+    markEmbeddedYomitanApiUnavailable(error);
+    throw error;
+  }
 }
 
-async function runBridgeMode() {
-  isDev = !app.isPackaged;
-  let bridgeWindow = null;
-  let bridgeReady = false;
-  let bridgeInitError = null;
+async function startEmbeddedYomitanApiServer() {
+  if (yomitanApiServer !== null) {
+    return;
+  }
 
-  const bridgeInitPromise = (async () => {
-    yomitanExt = await loadExtension('yomitan', { strict: true });
-    bridgeWindow = new BrowserWindow({
-      show: false,
-      width: 800,
-      height: 600,
-      webPreferences: {
-        contextIsolation: false,
-        nodeIntegration: false
-      }
-    });
-    await bridgeWindow.loadURL(`chrome-extension://${yomitanExt.id}/settings.html`);
-    await bridgeWindow.webContents.executeJavaScript('document.readyState', true);
-    bridgeReady = true;
-  })().catch((error) => {
-    bridgeInitError = String(error && error.message ? error.message : error);
-    console.error('[Bridge] Initialization failed:', error);
-    throw error;
-  });
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    crlfDelay: Infinity
-  });
-
-  rl.on('line', async (line) => {
-    let request = null;
+  if (!yomitanExt || !yomitanExt.id) {
+    markEmbeddedYomitanApiUnavailable('Yomitan extension is not loaded');
+  } else {
     try {
-      request = JSON.parse(line);
-    } catch (_error) {
-      return;
-    }
-    if (!request || typeof request !== 'object') {
-      return;
-    }
-
-    const id = Number.isFinite(Number(request.id)) ? Number(request.id) : -1;
-    const method = String(request.method || '');
-    const params = request.params && typeof request.params === 'object' ? request.params : {};
-
-    try {
-      if (method === 'ping') {
-        writeBridgeMessage({
-          id,
-          ok: true,
-          result: {
-            ready: bridgeReady && !bridgeInitError,
-            initializing: !bridgeReady && !bridgeInitError,
-            error: bridgeInitError || null
-          }
-        });
-        return;
-      }
-      if (method === 'shutdown') {
-        writeBridgeMessage({ id, ok: true, result: { shuttingDown: true } });
-        app.quit();
-        return;
-      }
-      if (method === 'tokenize_batch') {
-        await bridgeInitPromise;
-        if (!bridgeWindow || bridgeInitError) {
-          throw new Error(bridgeInitError || 'Bridge window not ready');
-        }
-        const texts = Array.isArray(params.texts) ? params.texts.map((value) => String(value || '')) : [];
-        const scanLength = Number(params.scanLength);
-        const result = await invokeBridgeParseBatch(bridgeWindow, texts, scanLength);
-        writeBridgeMessage({ id, ok: true, result });
-        return;
-      }
-      writeBridgeMessage({ id, ok: false, error: `Unknown method: ${method}` });
+      await ensureYomitanApiBridgeWindow();
+      markEmbeddedYomitanApiReady();
     } catch (error) {
-      writeBridgeMessage({ id, ok: false, error: String(error && error.message ? error.message : error) });
+      markEmbeddedYomitanApiUnavailable(error);
+      console.warn('[YomitanAPI] Bridge warmup failed; readiness probe will report unavailable:', error);
     }
+  }
+
+  const handler = async (request, response) => {
+    try {
+      if (request.method !== 'POST') {
+        response.writeHead(405, { Allow: 'POST' });
+        response.end();
+        return;
+      }
+
+      const urlObj = new URL(request.url || '/', `http://${EMBEDDED_YOMITAN_API_ADDR}:${EMBEDDED_YOMITAN_API_PORT}`);
+      const pathName = urlObj.pathname.replace(/^\/+/, '');
+
+      if (pathName === '' || pathName === 'serverVersion') {
+        const serverVersion = getServerVersionResponse(yomitanApiAvailabilityState, EMBEDDED_YOMITAN_API_VERSION);
+        sendJsonResponse(response, serverVersion.statusCode, serverVersion.payload);
+        return;
+      }
+
+      ensureYomitanApiAvailable(yomitanApiAvailabilityState);
+
+      const body = await readJsonBody(request);
+      const optionsContext = { current: true };
+
+      switch (pathName) {
+        case 'tokenize': {
+          const text = body.text;
+          const scanLength = Number(body.scanLength);
+          if (typeof text !== 'string' && !Array.isArray(text)) {
+            throw new Error('Invalid input for tokenize, expected "text" to be a string or a string array');
+          }
+          if (!Number.isFinite(scanLength)) {
+            throw new Error('Invalid input for tokenize, expected "scanLength" to be a number');
+          }
+          const result = await invokeYomitanExtensionApi('parseText', {
+            text,
+            optionsContext,
+            scanLength: Math.max(1, scanLength),
+            useInternalParser: true,
+            useMecabParser: false,
+          });
+          sendJsonResponse(response, 200, result);
+          return;
+        }
+        case 'termEntries': {
+          const term = typeof body.term === 'string' ? body.term : '';
+          const result = await invokeYomitanExtensionApi('termsFind', {
+            text: term,
+            details: {},
+            optionsContext,
+          });
+          sendJsonResponse(response, 200, result);
+          return;
+        }
+        case 'kanjiEntries': {
+          const character = typeof body.character === 'string' ? body.character : '';
+          const result = await invokeYomitanExtensionApi('kanjiFind', {
+            text: character,
+            details: {},
+            optionsContext,
+          });
+          sendJsonResponse(response, 200, result);
+          return;
+        }
+        default:
+          sendJsonResponse(response, 400, { error: `Unsupported action: ${pathName}` });
+      }
+    } catch (error) {
+      const statusCode = error && error.code === YOMITAN_API_UNAVAILABLE_CODE ? 503 : 500;
+      sendJsonResponse(response, statusCode, { error: String(error && error.message ? error.message : error) });
+    }
+  };
+
+  yomitanApiServer = http.createServer((request, response) => {
+    void handler(request, response);
   });
 
-  rl.on('close', () => {
-    app.quit();
+  await new Promise((resolve, reject) => {
+    yomitanApiServer.once('error', reject);
+    yomitanApiServer.listen(EMBEDDED_YOMITAN_API_PORT, EMBEDDED_YOMITAN_API_ADDR, () => {
+      yomitanApiServer.off('error', reject);
+      console.log(`[YomitanAPI] Embedded server running at http://${EMBEDDED_YOMITAN_API_ADDR}:${EMBEDDED_YOMITAN_API_PORT}`);
+      resolve();
+    });
   });
-
-  await bridgeInitPromise;
 }
 
 function readExtensionVersions() {
@@ -844,6 +906,7 @@ function readExtensionPackageVersion(dirPath) {
 }
 
 function ensureExtensionCopy(name, sourceDir) {
+  // On non-Linux in normal overlay mode, keep source path.
   if (!isLinux()) {
     return sourceDir;
   }
@@ -854,7 +917,10 @@ function ensureExtensionCopy(name, sourceDir) {
   const storedVersion = versions[name] || null;
 
   let shouldCopy = false;
-  if (!fs.existsSync(targetDir)) {
+  if (isDev) {
+    // In dev we must always refresh copied extension files or stale JS persists.
+    shouldCopy = true;
+  } else if (!fs.existsSync(targetDir)) {
     shouldCopy = true;
   } else if (sourceVersion && sourceVersion !== storedVersion) {
     shouldCopy = true;
@@ -2316,11 +2382,6 @@ function updateTrayMenu() {
 
 
 app.whenReady().then(async () => {
-  if (BRIDGE_MODE) {
-    await runBridgeMode();
-    return;
-  }
-
   if (!isWindows()) {
     userSettings.manualMode = true; // enforce manual mode on non-Windows platforms
     // Show a warning for now saying that automatic mode is not supported, and to show the overlay manually, use the hotkey
@@ -2383,7 +2444,7 @@ app.whenReady().then(async () => {
         } else {
 
           // SCENARIO A: Fresh Install
-          // If settings.json does NOT exist, this is a new user. 
+          // If settings.json does NOT exist, this is a new user.
           // Put them on the Static ID immediately. No questions asked.
           if (!userSettingsExists) {
             console.log("[Init] Fresh install detected. Applying static manifest.");
@@ -2422,9 +2483,9 @@ app.whenReady().then(async () => {
               if (response === 0) {
                 // USER CHOSE: LOAD OLD (Backup Data)
                 // Ensure we are running the manifest WITHOUT the key.
-                // In your repo, manifest.json usually has no key. 
-                // If for some reason it has a key (leftover), we assume the user handles it or 
-                // we could restore a no-key version if we had a backup. 
+                // In your repo, manifest.json usually has no key.
+                // If for some reason it has a key (leftover), we assume the user handles it or
+                // we could restore a no-key version if we had a backup.
                 // For now, assuming manifest.json IS the old version default.
                 console.log("[Init] User chose to load old version.");
                 // Proceed to load extension normally below...
@@ -2461,7 +2522,7 @@ app.whenReady().then(async () => {
 
           // SCENARIO C: Already Migrated
           else if (isMigrated) {
-            // Ensure the manifest is still the Static one. 
+            // Ensure the manifest is still the Static one.
             // (e.g. if user updated the app and a new default manifest.json overwrote the static one)
             // We compare content or just blindly overwrite to be safe.
             console.log("[Init] Migration marker found. Enforcing static manifest.");
@@ -2478,11 +2539,15 @@ app.whenReady().then(async () => {
   // END MIGRATION LOGIC
   // ===========================================================
 
-
   // Start background manager and register periodic tasks
   bg.start();
 
   yomitanExt = await loadExtension('yomitan');
+  try {
+    await startEmbeddedYomitanApiServer();
+  } catch (error) {
+    console.error('[YomitanAPI] Failed to start embedded API server:', error);
+  }
   if (userSettings.enableJitenReader) {
     jitenReaderExt = await loadExtension('jiten.reader');
   }
@@ -2668,6 +2733,20 @@ app.whenReady().then(async () => {
       clearTimeout(pendingDisplaySyncTimer);
       pendingDisplaySyncTimer = null;
     }
+    if (yomitanApiServer) {
+      try {
+        yomitanApiServer.close();
+      } catch (error) {
+        console.warn('[YomitanAPI] Failed closing embedded server:', error);
+      }
+      yomitanApiServer = null;
+    }
+    if (yomitanApiBridgeWindow && !yomitanApiBridgeWindow.isDestroyed()) {
+      yomitanApiBridgeWindow.destroy();
+      yomitanApiBridgeWindow = null;
+    }
+    yomitanApiBridgeReadyPromise = null;
+    markEmbeddedYomitanApiUnavailable('App is quitting');
   });
 
   let display = getCurrentOverlayMonitor({ logFallback: true });

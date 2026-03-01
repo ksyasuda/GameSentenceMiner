@@ -17,8 +17,6 @@ from typing import Optional, List, Any
 from GameSentenceMiner.util.config.configuration import logger
 from GameSentenceMiner.util.database.cron_table import CronTable
 
-DAILY_TOKENIZATION_FAILURE_RETRY_SECONDS = 15 * 60
-
 
 class Crons(enum.Enum):
     POPULATE_GAMES = 'populate_games'
@@ -26,8 +24,6 @@ class Crons(enum.Enum):
     DAILY_STATS_ROLLUP = 'daily_stats_rollup'
     USER_PLUGINS = "user_plugins"
     JITEN_UPGRADER = 'jiten_upgrader'
-    BACKFILL_TOKENIZATION = 'backfill_tokenization'
-    DAILY_TOKENIZATION = 'daily_tokenization'
 
 @dataclass
 class MockCron:
@@ -86,12 +82,6 @@ class CronScheduler:
     
     def force_jiten_upgrader(self):
         self.add_external_task(Crons.JITEN_UPGRADER)
-
-    def force_backfill_tokenization(self):
-        self.add_external_task(Crons.BACKFILL_TOKENIZATION)
-
-    def force_daily_tokenization(self):
-        self.add_external_task(Crons.DAILY_TOKENIZATION)
     
     async def start(self):
         """Start the cron scheduler in the background."""
@@ -276,50 +266,6 @@ def _run_due_crons_sync(force_task: Optional['Crons'] = None) -> dict:
                 
                 logger.background(f"Successfully executed {cron.name}")
                 logger.background(f"Upgraded: {result.get('upgraded_to_jiten', 0)} games, Not found: {result.get('not_found_on_jiten', 0)}")
-
-            elif cron.name == Crons.BACKFILL_TOKENIZATION.value:
-                from GameSentenceMiner.util.cron.backfill_tokenization import (
-                    backfill_tokenization,
-                )
-
-                result = backfill_tokenization()
-
-                if cron.id != -1 and not result.get("skipped"):
-                    CronTable.just_ran(cron.id)
-
-                executed_count += 1
-                detail['success'] = True
-                detail['result'] = result
-
-                logger.background(f"Successfully executed {cron.name}")
-
-            elif cron.name == Crons.DAILY_TOKENIZATION.value:
-                from GameSentenceMiner.util.cron.backfill_tokenization import (
-                    backfill_tokenization,
-                )
-
-                logger.info("Starting daily tokenization catchup")
-                result = backfill_tokenization()
-                logger.info(f"Daily tokenization catchup complete: {result}")
-
-                if cron.id != -1:
-                    total = int(result.get("total", 0))
-                    processed = int(result.get("processed", 0))
-                    failed = int(result.get("failed", 0))
-
-                    if not (total > 0 and processed == 0 and failed >= total):
-                        CronTable.just_ran(cron.id)
-                    else:
-                        cron.next_run = max(
-                            float(getattr(cron, "next_run", 0) or 0),
-                            time.time() + DAILY_TOKENIZATION_FAILURE_RETRY_SECONDS,
-                        )
-                        cron.save()
-                executed_count += 1
-                detail['success'] = True
-                detail['result'] = result
-
-                logger.background(f"Successfully executed {cron.name}")
                 
             else:
                 logger.error(f"⚠️ Unknown scheduled task: {cron.name}")

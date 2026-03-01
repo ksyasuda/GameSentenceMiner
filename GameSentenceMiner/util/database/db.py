@@ -1921,46 +1921,6 @@ def check_and_run_migrations():
         else:
             logger.debug("jiten_upgrader scheduled task already exists, skipping creation.")
 
-    def migrate_tokenization_crons():
-        try:
-            backfill_cron = CronTable.get_by_name("backfill_tokenization")
-            if not backfill_cron:
-                CronTable.create_cron_entry(
-                    name="backfill_tokenization",
-                    description="One-time backfill of Yomitan tokenization for existing game lines",
-                    next_run=(datetime.now() - timedelta(minutes=1)).timestamp(),
-                    schedule="once",
-                    enabled=True,
-                )
-
-            daily_cron = CronTable.get_by_name("daily_tokenization")
-            if not daily_cron:
-                next_run = datetime.now().replace(hour=1, minute=0, second=0, microsecond=0)
-                if next_run < datetime.now():
-                    next_run += timedelta(days=1)
-                CronTable.create_cron_entry(
-                    name="daily_tokenization",
-                    description="Daily catchup to tokenize lines that remain untokenized",
-                    next_run=next_run.timestamp(),
-                    schedule="daily",
-                    enabled=True,
-                )
-            elif daily_cron.enabled is False:
-                pending_lines = GameLinesTable._db.fetchone(
-                    f"SELECT id FROM {GameLinesTable._table} "
-                    "WHERE line_text IS NOT NULL "
-                    "  AND TRIM(line_text) != '' "
-                    f"  AND (COALESCE(tokenized, {TOKENIZED_PENDING}) = {TOKENIZED_PENDING} "
-                    f"OR COALESCE(tokenized, {TOKENIZED_PENDING}) = {TOKENIZED_RETRYABLE_FAILED}) "
-                    "LIMIT 1"
-                )
-                if pending_lines:
-                    daily_cron.enabled = True
-                    daily_cron.next_run = time.time()
-                daily_cron.save()
-        except Exception as e:
-            logger.error(f"⚠️ Failed to create tokenization cron jobs: {e}")
-
     def migrate_genres_and_tags():
         """
         Add genres and tags columns to games table.
@@ -2013,7 +1973,6 @@ def check_and_run_migrations():
     migrate_genres_and_tags()  # Add genres and tags columns
     migrate_user_plugins_cron_job()
     migrate_jiten_upgrader_cron_job()  # Weekly check for new Jiten entries
-    migrate_tokenization_crons()
         
 check_and_run_migrations()
     

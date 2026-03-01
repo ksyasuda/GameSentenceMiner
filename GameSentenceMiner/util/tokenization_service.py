@@ -1,14 +1,8 @@
-import json
 import os
-import platform
 import queue
-import shlex
-import shutil
-import subprocess
 import threading
 import time
 from collections import Counter, defaultdict
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import regex
@@ -31,7 +25,12 @@ from GameSentenceMiner.util.database.db import (
 
 _JAPANESE_TEXT_REGEX = regex.compile(r"[\p{Script=Hiragana}\p{Script=Katakana}\p{Han}]")
 _KANJI_REGEX = regex.compile(r"\p{Han}")
-DEFAULT_BRIDGE_IDLE_TIMEOUT_SECONDS = 5 * 60
+_HIRAGANA_REGEX = regex.compile(r"\p{Script=Hiragana}")
+_SINGLE_UNPARSED_TOKEN_FALLBACK_MAX_CHARS = 12
+
+
+def _is_database_locked_error(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
 
 
 def _normalize_reading(value: Any) -> str:
@@ -85,7 +84,19 @@ def _is_unparsed_content_group(group: Sequence[Any]) -> bool:
     return True
 
 
-def _extract_tokens_from_yomitan_payload(payload: Any) -> List[Dict[str, str]]:
+def _is_token_like_unparsed_word(word: str) -> bool:
+    if not word:
+        return False
+    if len(word) > _SINGLE_UNPARSED_TOKEN_FALLBACK_MAX_CHARS:
+        return False
+    if any(ch.isspace() for ch in word):
+        return False
+    if _HIRAGANA_REGEX.search(word):
+        return False
+    return any(ch.isalnum() for ch in word)
+
+
+def _extract_tokens_from_yomitan_payload(payload: Any, target_index: Optional[int] = None) -> List[Dict[str, str]]:
     if isinstance(payload, dict) and isinstance(payload.get("tokens"), list):
         tokens: List[Dict[str, str]] = []
         for entry in payload.get("tokens") or []:
@@ -98,15 +109,21 @@ def _extract_tokens_from_yomitan_payload(payload: Any) -> List[Dict[str, str]]:
     if not isinstance(payload, list) or not payload:
         return []
 
+    if target_index is None:
+        target_index = 0
+
     indexed = [
         entry for entry in payload
         if isinstance(entry, dict)
-        and int(entry.get("index", -1)) == 0
+        and int(entry.get("index", -1)) == target_index
         and isinstance(entry.get("content"), list)
     ]
     candidates = indexed if indexed else [
-        entry for entry in payload
-        if isinstance(entry, dict) and isinstance(entry.get("content"), list)
+        entry
+        for entry in payload
+        if isinstance(entry, dict)
+        and "index" not in entry
+        and isinstance(entry.get("content"), list)
     ]
     if not candidates:
         return []
@@ -115,6 +132,23 @@ def _extract_tokens_from_yomitan_payload(payload: Any) -> List[Dict[str, str]]:
     content = selected.get("content") or []
 
     if content and all(_is_unparsed_content_group(group) for group in content):
+        if len(content) > 1:
+            tokens: List[Dict[str, str]] = []
+            for group in content:
+                if not isinstance(group, list):
+                    continue
+                word = "".join(str(seg.get("text") or "") for seg in group if isinstance(seg, dict)).strip()
+                if not word:
+                    continue
+                tokens.append({"headword": word, "word": word, "reading": "-"})
+            if tokens:
+                return tokens
+        if len(content) == 1:
+            group = content[0]
+            if isinstance(group, list):
+                word = "".join(str(seg.get("text") or "") for seg in group if isinstance(seg, dict)).strip()
+                if _is_token_like_unparsed_word(word):
+                    return [{"headword": word, "word": word, "reading": "-"}]
         return []
 
     tokens: List[Dict[str, str]] = []
@@ -149,286 +183,6 @@ def _prepare_text_for_tokenization(text: str) -> str:
     return cleaned
 
 
-class OverlayTokenizerBridgeClient:
-    def __init__(self) -> None:
-        self._process: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
-        self._request_id = 0
-        self._idle_timer: Optional[threading.Timer] = None
-        self._stderr_pump_thread: Optional[threading.Thread] = None
-        self.idle_timeout_seconds = int(
-            os.environ.get(
-                "GSM_TOKENIZER_BRIDGE_IDLE_TIMEOUT_SEC",
-                str(DEFAULT_BRIDGE_IDLE_TIMEOUT_SECONDS),
-            )
-        )
-
-    @staticmethod
-    def _resolve_bridge_user_data_dir() -> str:
-        bridge_data_dir = str(os.environ.get("GSM_TOKENIZER_BRIDGE_USER_DATA_DIR", "")).strip()
-        if bridge_data_dir:
-            return bridge_data_dir
-
-        if platform.system().lower().startswith("win") and os.environ.get("APPDATA"):
-            base_dir = Path(os.environ["APPDATA"])
-        else:
-            base_dir = Path.home() / ".config"
-        return str(base_dir / "GameSentenceMiner" / "gsm_overlay_tokenizer_bridge")
-
-    @staticmethod
-    def _build_bridge_env() -> Dict[str, str]:
-        env = dict(os.environ)
-        env["GSM_TOKENIZER_BRIDGE_USER_DATA_DIR"] = OverlayTokenizerBridgeClient._resolve_bridge_user_data_dir()
-        env["GSM_TOKENIZER_BRIDGE_MODE"] = "1"
-        return env
-
-    @staticmethod
-    def _resolve_overlay_exec_name() -> str:
-        return "gsm_overlay.exe" if platform.system().lower().startswith("win") else "gsm_overlay"
-
-    @staticmethod
-    def _resolve_overlay_platform_tag() -> str:
-        sys_platform = platform.system().lower()
-        if sys_platform.startswith("win"):
-            return "win32"
-        if sys_platform.startswith("darwin"):
-            return "darwin"
-        return "linux"
-
-    @staticmethod
-    def _resolve_overlay_arch_tag() -> str:
-        machine = platform.machine().lower()
-        if machine in {"x86_64", "amd64"}:
-            return "x64"
-        if machine in {"arm64", "aarch64"}:
-            return "arm64"
-        return machine or "x64"
-
-    def _resolve_packaged_overlay_bridge_command(
-        self,
-        repo_root: Path,
-    ) -> Optional[Tuple[List[str], str]]:
-        overlay_exec_path = str(os.environ.get("GSM_OVERLAY_EXEC_PATH", "")).strip()
-        if overlay_exec_path and Path(overlay_exec_path).exists():
-            return [overlay_exec_path, "--bridge"], str(Path(overlay_exec_path).parent)
-
-        platform_tag = self._resolve_overlay_platform_tag()
-        arch_tag = self._resolve_overlay_arch_tag()
-        exec_name = self._resolve_overlay_exec_name()
-        candidate = (
-            repo_root
-            / "GSM_Overlay"
-            / "out"
-            / f"gsm_overlay-{platform_tag}-{arch_tag}"
-            / exec_name
-        )
-        if candidate.exists():
-            return [str(candidate), "--bridge"], str(candidate.parent)
-        return None
-
-    def _resolve_command(self) -> Tuple[List[str], str]:
-        cmd_env = str(os.environ.get("GSM_TOKENIZER_BRIDGE_CMD", "")).strip()
-        if cmd_env:
-            cmd = shlex.split(cmd_env)
-            if not cmd:
-                raise RuntimeError("GSM_TOKENIZER_BRIDGE_CMD is set but empty")
-            resolved_cmd = cmd[0]
-            resolved_cmd_path = shutil.which(resolved_cmd) or str(Path(resolved_cmd).resolve()) if Path(resolved_cmd).exists() else None
-            if not resolved_cmd_path:
-                raise RuntimeError(
-                    f"GSM_TOKENIZER_BRIDGE_CMD points to a missing executable: {resolved_cmd}"
-                )
-            return cmd, str(Path.cwd())
-
-        bridge_bin_env = str(os.environ.get("GSM_TOKENIZER_BRIDGE_BIN", "")).strip()
-        if bridge_bin_env:
-            bridge_bin_path = Path(bridge_bin_env)
-            if bridge_bin_path.exists():
-                return [str(bridge_bin_path), "--bridge"], str(
-                    bridge_bin_path.parent if bridge_bin_path.parent.exists() else Path.cwd()
-                )
-            resolved_bridge_bin = shutil.which(str(bridge_bin_env))
-            if not resolved_bridge_bin:
-                raise RuntimeError(
-                    f"GSM_TOKENIZER_BRIDGE_BIN points to a missing executable: {bridge_bin_env}"
-                )
-            return [resolved_bridge_bin, "--bridge"], str(Path.cwd())
-
-        electron_bin = str(os.environ.get("GSM_OVERLAY_ELECTRON_BIN", "electron")).strip()
-        repo_root = Path(__file__).resolve().parents[2]
-        overlay_dir = repo_root / "GSM_Overlay"
-        resolved_electron_bin = shutil.which(electron_bin) or (
-            str(Path(electron_bin).resolve()) if Path(electron_bin).exists() else None
-        )
-        if resolved_electron_bin:
-            return [resolved_electron_bin, ".", "--bridge"], str(overlay_dir)
-
-        packaged_command = self._resolve_packaged_overlay_bridge_command(repo_root)
-        if packaged_command:
-            return packaged_command
-        raise RuntimeError(
-            f"Could not resolve tokenizer bridge command. Set GSM_TOKENIZER_BRIDGE_CMD or GSM_TOKENIZER_BRIDGE_BIN. "
-            f"Checked electron candidates: {electron_bin}"
-        )
-
-    def _start_stderr_pump(self) -> None:
-        if self._process is None or self._process.stderr is None:
-            return
-        if self._stderr_pump_thread is not None and self._stderr_pump_thread.is_alive():
-            return
-
-        proc = self._process
-        stderr = proc.stderr
-
-        def _pump() -> None:
-            try:
-                for raw_line in iter(stderr.readline, ""):
-                    if not raw_line:
-                        break
-                    line = raw_line.rstrip()
-                    if line:
-                        logger.info(f"[TokenizerBridge] {line}")
-            except Exception:
-                pass
-
-        self._stderr_pump_thread = threading.Thread(
-            target=_pump,
-            name="gsm-tokenizer-bridge-stderr",
-            daemon=True,
-        )
-        self._stderr_pump_thread.start()
-
-    def _cancel_idle_timer(self) -> None:
-        if self._idle_timer is not None:
-            self._idle_timer.cancel()
-            self._idle_timer = None
-
-    def _schedule_idle_shutdown(self) -> None:
-        self._cancel_idle_timer()
-        if self.idle_timeout_seconds <= 0:
-            return
-
-        self._idle_timer = threading.Timer(self.idle_timeout_seconds, self.shutdown)
-        self._idle_timer.daemon = True
-        self._idle_timer.start()
-
-    def _ensure_started(self) -> None:
-        if self._process is not None and self._process.poll() is None:
-            return
-
-        cmd, cwd = self._resolve_command()
-        try:
-            self._process = subprocess.Popen(
-                cmd,
-                cwd=cwd,
-                env=self._build_bridge_env(),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-        except Exception as exc:
-            logger.warning(f"Failed to launch tokenizer bridge command={cmd} cwd={cwd}: {exc}")
-            raise
-        self._start_stderr_pump()
-
-    def _read_response_line(self, timeout: float) -> str:
-        assert self._process is not None and self._process.stdout is not None
-        line_queue: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=1)
-
-        def _reader() -> None:
-            try:
-                line_queue.put(self._process.stdout.readline())
-            except Exception:
-                line_queue.put(None)
-
-        reader_thread = threading.Thread(target=_reader, daemon=True)
-        reader_thread.start()
-        try:
-            line = line_queue.get(timeout=max(1.0, timeout))
-        except queue.Empty as exc:
-            raise TimeoutError("Timed out waiting for bridge response") from exc
-        if not line:
-            raise RuntimeError("Bridge process closed stdout unexpectedly")
-        return line
-
-    def _invoke(self, method: str, params: Dict[str, Any], timeout: float) -> Any:
-        self._ensure_started()
-        assert self._process is not None and self._process.stdin is not None
-
-        self._request_id += 1
-        request_id = self._request_id
-        payload = {"id": request_id, "method": method, "params": params}
-        self._process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        self._process.stdin.flush()
-
-        while True:
-            line = self._read_response_line(timeout)
-            parsed = json.loads(line)
-            if int(parsed.get("id", -1)) != request_id:
-                continue
-            if not parsed.get("ok", False):
-                raise RuntimeError(str(parsed.get("error", "Unknown bridge error")))
-            return parsed.get("result")
-
-    def is_available(self) -> bool:
-        with self._lock:
-            try:
-                result = self._invoke("ping", {}, timeout=5.0)
-                return bool(result and result.get("ready", False))
-            except Exception:
-                return False
-
-    def tokenize_batch_raw(
-        self,
-        texts: Sequence[str],
-        scan_length: int,
-        timeout: float,
-    ) -> List[Optional[Any]]:
-        with self._lock:
-            result = self._invoke(
-                "tokenize_batch",
-                {
-                    "texts": [str(x or "") for x in texts],
-                    "scanLength": int(scan_length),
-                },
-                timeout=max(10.0, float(timeout)),
-            )
-            self._schedule_idle_shutdown()
-            if not isinstance(result, list):
-                raise RuntimeError("Bridge returned invalid tokenize_batch result")
-            return [item if item is not None else None for item in result]
-
-    def shutdown(self) -> None:
-        with self._lock:
-            self._cancel_idle_timer()
-            proc = self._process
-            self._process = None
-            if proc is None:
-                return
-            try:
-                if proc.stdin is not None and proc.poll() is None:
-                    proc.stdin.write(json.dumps({"id": -1, "method": "shutdown", "params": {}}) + "\n")
-                    proc.stdin.flush()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=3.0)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-    def restart(self) -> None:
-        self.shutdown()
-
-
 class TokenizationService:
     def __init__(self) -> None:
         self.api_base_url = str(
@@ -437,18 +191,22 @@ class TokenizationService:
         self.request_timeout = float(os.environ.get("GSM_TOKENIZER_TIMEOUT_SEC", "30"))
         self.scan_length = int(os.environ.get("GSM_TOKENIZER_SCAN_LENGTH", "10"))
         self.chunk_size = max(1, int(os.environ.get("GSM_TOKENIZER_CHUNK_SIZE", "64")))
+        self.backfill_chunk_size = max(
+            1,
+            int(os.environ.get("GSM_TOKENIZER_BACKFILL_CHUNK_SIZE", "8")),
+        )
+        self.backfill_persist_chunk_size = max(
+            1,
+            int(os.environ.get("GSM_TOKENIZER_BACKFILL_PERSIST_CHUNK_SIZE", "32")),
+        )
+        self.backfill_priority_persist_chunk_size = max(
+            1,
+            int(os.environ.get("GSM_TOKENIZER_BACKFILL_PRIORITY_PERSIST_CHUNK_SIZE", "16")),
+        )
         self.enabled = os.environ.get("GSM_TOKENIZER_ENABLED", "1") != "0"
         self.backend = str(os.environ.get("GSM_TOKENIZER_BACKEND", "auto")).strip().lower()
-        self.allow_bridge_fallback = os.environ.get(
-            "GSM_TOKENIZER_ALLOW_BRIDGE_FALLBACK",
-            "1",
-        ) == "1"
-        self._bridge_client: Optional[OverlayTokenizerBridgeClient] = None
         self._backfill_session_active = False
         self._backfill_backend_choice: Optional[str] = None
-
-    def _use_bridge_backend(self) -> bool:
-        return self.backend in {"bridge", "overlay-bridge"}
 
     def _use_http_backend(self) -> bool:
         return self.backend in {"http", "yomitan-api"}
@@ -456,58 +214,52 @@ class TokenizationService:
     def _use_auto_backend(self) -> bool:
         return self.backend in {"auto", "hybrid"}
 
-    def _get_bridge_client(self) -> OverlayTokenizerBridgeClient:
-        if self._bridge_client is None:
-            self._bridge_client = OverlayTokenizerBridgeClient()
-        return self._bridge_client
-
     def begin_backfill_session(self) -> None:
         self._backfill_session_active = True
         self._backfill_backend_choice = None
-        if self._bridge_client is not None:
-            self._get_bridge_client()._cancel_idle_timer()
 
     def end_backfill_session(self) -> None:
         self._backfill_session_active = False
         self._backfill_backend_choice = None
-        if self._bridge_client is not None:
-            self._bridge_client.shutdown()
 
     def is_backfill_session_active(self) -> bool:
         return self._backfill_session_active
 
     def _select_backend(self, source: str, timeout: float = 0.35) -> str:
         source_kind = "backfill" if source == "backfill" else "realtime"
-        if self._use_bridge_backend():
-            return "bridge"
         if self._use_http_backend():
             return "http"
         if not self._use_auto_backend():
             return "none"
 
         if source_kind == "backfill":
-            if self._backfill_backend_choice in {"http", "bridge"}:
+            if self._backfill_backend_choice == "http":
                 return self._backfill_backend_choice
             if self._is_http_tokenizer_available(timeout):
                 self._backfill_backend_choice = "http"
                 return "http"
-            if self.allow_bridge_fallback:
-                self._backfill_backend_choice = "bridge"
-                return "bridge"
-            self._backfill_backend_choice = "none"
             return "none"
 
         if self._is_http_tokenizer_available(timeout):
             return "http"
-        if self.allow_bridge_fallback:
-            return "bridge"
         return "none"
 
     def _is_http_tokenizer_available(self, timeout: float = 0.5) -> bool:
         health_url = f"{self.api_base_url}/health"
+        server_version_url = f"{self.api_base_url}/serverVersion"
         tokenize_url = f"{self.api_base_url}/tokenize"
         try:
             response = requests.get(health_url, timeout=max(0.1, timeout))
+            if response.ok:
+                return True
+        except Exception:
+            pass
+        try:
+            response = requests.post(
+                server_version_url,
+                json={},
+                timeout=max(0.1, timeout),
+            )
             if response.ok:
                 return True
         except Exception:
@@ -528,8 +280,6 @@ class TokenizationService:
         backend = self._select_backend(source=source, timeout=timeout)
         if backend == "http":
             return self._is_http_tokenizer_available(timeout)
-        if backend == "bridge":
-            return self._get_bridge_client().is_available()
         return False
 
     def _tokenize_one(self, text: str) -> List[Dict[str, str]]:
@@ -542,37 +292,32 @@ class TokenizationService:
         payload = response.json()
         return _extract_tokens_from_yomitan_payload(payload)
 
+    def _tokenize_many(self, texts: Sequence[str]) -> List[List[Dict[str, str]]]:
+        response = requests.post(
+            f"{self.api_base_url}/tokenize",
+            json={"text": list(texts), "scanLength": self.scan_length},
+            timeout=self.request_timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return [
+            _extract_tokens_from_yomitan_payload(payload, target_index=index)
+            for index in range(len(texts))
+        ]
+
     def _tokenize_texts(self, texts: Sequence[str], source: str = "realtime") -> List[Optional[List[Dict[str, str]]]]:
         backend = self._select_backend(source=source, timeout=0.35)
 
-        if backend == "bridge":
-            bridge_client = self._get_bridge_client()
-            bridge_timeout = max(10.0, self.request_timeout * max(1, len(texts)))
-            for attempt in range(2):
-                try:
-                    raw_payloads = bridge_client.tokenize_batch_raw(
-                        texts=texts,
-                        scan_length=self.scan_length,
-                        timeout=bridge_timeout,
-                    )
-                    results: List[Optional[List[Dict[str, str]]]] = []
-                    for text, payload in zip(texts, raw_payloads):
-                        if payload is None:
-                            results.append(None)
-                        else:
-                            tokenized = _extract_tokens_from_yomitan_payload(payload)
-                            results.append(tokenized)
-                    while len(results) < len(texts):
-                        results.append(None)
-                    return results[: len(texts)]
-                except Exception as e:
-                    logger.warning(f"Tokenizer bridge request failed: {e}")
-                    if attempt == 0:
-                        bridge_client.restart()
-                        continue
-                    return [None for _ in texts]
-        elif backend == "none":
+        if backend == "none":
             return [None for _ in texts]
+
+        if not texts:
+            return []
+
+        try:
+            return self._tokenize_many(texts)
+        except Exception as e:
+            logger.warning(f"Tokenizer HTTP batch request failed: {e}. Falling back to per-text requests.")
 
         results: List[Optional[List[Dict[str, str]]]] = []
         for text in texts:
@@ -621,11 +366,22 @@ class TokenizationService:
             assignments.append("kanji_count=?")
             params.append(kanji_count)
         params.append(line_id)
-        GameLinesTable._db.execute(
-            f"UPDATE {GameLinesTable._table} SET {', '.join(assignments)} WHERE id=?",
-            tuple(params),
-            commit=True,
-        )
+        max_attempts = 8
+        retry_delay_seconds = 0.05
+        max_retry_delay_seconds = 0.5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                GameLinesTable._db.execute(
+                    f"UPDATE {GameLinesTable._table} SET {', '.join(assignments)} WHERE id=?",
+                    tuple(params),
+                    commit=True,
+                )
+                return
+            except Exception as exc:
+                if not _is_database_locked_error(exc) or attempt >= max_attempts:
+                    raise
+                time.sleep(retry_delay_seconds)
+                retry_delay_seconds = min(retry_delay_seconds * 2, max_retry_delay_seconds)
 
     def _recompute_word_cache_rows(self, conn: Any, word_ids: Iterable[int]) -> None:
         for word_id in {int(x) for x in word_ids if x is not None}:
@@ -860,27 +616,104 @@ class TokenizationService:
     def _persist_entries_with_fallback(
         self,
         entries: Sequence[Tuple[str, str, float, str, Sequence[Dict[str, Any]]]],
+        source: str = "realtime",
     ) -> Tuple[int, int]:
         if not entries:
             return (0, 0)
-        try:
-            self._persist_lines_tokenization_batch(entries)
-            return (len(entries), 0)
-        except Exception as e:
-            logger.warning(
-                f"Batch tokenization persistence failed for {len(entries)} lines: {e}. Falling back to per-line persistence."
-            )
-            processed = 0
-            failed = 0
-            for line_id, line_text, timestamp, game_id, tokens in entries:
+        source_kind = "backfill" if source == "backfill" else "realtime"
+        batch_attempts = 8 if source_kind == "realtime" else 12
+        retry_delay_seconds = 0.03 if source_kind == "realtime" else 0.08
+        max_retry_delay_seconds = 0.5
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, batch_attempts + 1):
+            try:
+                self._persist_lines_tokenization_batch(entries)
+                return (len(entries), 0)
+            except Exception as exc:
+                last_exc = exc
+                if not _is_database_locked_error(exc) or attempt >= batch_attempts:
+                    break
+                if source_kind == "backfill" and has_pending_realtime_work():
+                    time.sleep(max(retry_delay_seconds, 0.1))
+                else:
+                    time.sleep(retry_delay_seconds)
+                retry_delay_seconds = min(retry_delay_seconds * 2, max_retry_delay_seconds)
+
+        logger.warning(
+            f"Batch tokenization persistence failed for {len(entries)} lines: {last_exc}. Falling back to per-line persistence."
+        )
+        processed = 0
+        failed = 0
+        for line_id, line_text, timestamp, game_id, tokens in entries:
+            per_line_attempts = 6 if source_kind == "realtime" else 10
+            line_delay_seconds = 0.03 if source_kind == "realtime" else 0.08
+            line_max_delay = 0.5
+            line_persisted = False
+            line_last_exc: Optional[Exception] = None
+            for attempt in range(1, per_line_attempts + 1):
                 try:
                     self._persist_line_tokenization(line_id, line_text, timestamp, game_id, tokens)
+                    line_persisted = True
                     processed += 1
+                    break
                 except Exception as inner_exc:
-                    logger.warning(f"Tokenization persistence failed for line {line_id}: {inner_exc}")
-                    self._set_line_tokenized_status(line_id, TOKENIZED_RETRYABLE_FAILED)
-                    failed += 1
-            return (processed, failed)
+                    line_last_exc = inner_exc
+                    if not _is_database_locked_error(inner_exc) or attempt >= per_line_attempts:
+                        break
+                    if source_kind == "backfill" and has_pending_realtime_work():
+                        time.sleep(max(line_delay_seconds, 0.1))
+                    else:
+                        time.sleep(line_delay_seconds)
+                    line_delay_seconds = min(line_delay_seconds * 2, line_max_delay)
+            if line_persisted:
+                continue
+            logger.warning(f"Tokenization persistence failed for line {line_id}: {line_last_exc}")
+            try:
+                self._set_line_tokenized_status(line_id, TOKENIZED_RETRYABLE_FAILED)
+            except Exception as status_exc:
+                logger.warning(
+                    f"Failed to mark line {line_id} as retryable after persistence failure: {status_exc}"
+                )
+            failed += 1
+        return (processed, failed)
+
+    def _persist_entries_chunked(
+        self,
+        entries: Sequence[Tuple[str, str, float, str, Sequence[Dict[str, Any]]]],
+        source: str = "realtime",
+    ) -> Tuple[int, int]:
+        if not entries:
+            return (0, 0)
+        source_kind = "backfill" if source == "backfill" else "realtime"
+        total_processed = 0
+        total_failed = 0
+        if source_kind != "backfill":
+            chunk_processed, chunk_failed = self._persist_entries_with_fallback(entries, source=source)
+            total_processed += chunk_processed
+            total_failed += chunk_failed
+            return (total_processed, total_failed)
+
+        entry_list = list(entries)
+        index = 0
+        while index < len(entry_list):
+            pending_realtime = has_pending_realtime_work()
+            chunk_size = (
+                self.backfill_priority_persist_chunk_size
+                if pending_realtime
+                else self.backfill_persist_chunk_size
+            )
+            chunk_size = max(1, int(chunk_size))
+            chunk = entry_list[index:index + chunk_size]
+            chunk_processed, chunk_failed = self._persist_entries_with_fallback(chunk, source=source)
+            total_processed += chunk_processed
+            total_failed += chunk_failed
+            index += len(chunk)
+
+            if pending_realtime:
+                time.sleep(0.06)
+
+        return (total_processed, total_failed)
 
     def remove_lines_occurrences(self, line_ids: Sequence[str]) -> None:
         line_ids = [line_id for line_id in dict.fromkeys(line_ids) if line_id]
@@ -937,18 +770,20 @@ class TokenizationService:
 
         processed = 0
         failed = 0
+        source_kind = "backfill" if source == "backfill" else "realtime"
 
         prefiltered_entries: List[Tuple[str, str, float, str, Sequence[Dict[str, Any]]]] = []
         for idx in prefiltered_success_indices:
             line_id, line_text_original, _line_text_tokenize, timestamp, game_id = normalized_rows[idx]
             prefiltered_entries.append((line_id, line_text_original, timestamp, game_id, []))
-        batch_processed, batch_failed = self._persist_entries_with_fallback(prefiltered_entries)
+        batch_processed, batch_failed = self._persist_entries_chunked(prefiltered_entries, source=source_kind)
         processed += batch_processed
         failed += batch_failed
 
         unique_texts = list(text_to_indices.keys())
-        for start in range(0, len(unique_texts), self.chunk_size):
-            text_chunk = unique_texts[start:start + self.chunk_size]
+        tokenize_chunk_size = self.backfill_chunk_size if source_kind == "backfill" else self.chunk_size
+        for start in range(0, len(unique_texts), tokenize_chunk_size):
+            text_chunk = unique_texts[start:start + tokenize_chunk_size]
             tokenized_chunk = self._tokenize_texts(text_chunk, source=source)
             chunk_entries: List[Tuple[str, str, float, str, Sequence[Dict[str, Any]]]] = []
             for text, tokenized in zip(text_chunk, tokenized_chunk):
@@ -962,7 +797,7 @@ class TokenizationService:
                 for idx in line_indices:
                     line_id, line_text_original, _line_text_tokenize, timestamp, game_id = normalized_rows[idx]
                     chunk_entries.append((line_id, line_text_original, timestamp, game_id, tokenized))
-            batch_processed, batch_failed = self._persist_entries_with_fallback(chunk_entries)
+            batch_processed, batch_failed = self._persist_entries_chunked(chunk_entries, source=source_kind)
             processed += batch_processed
             failed += batch_failed
 
@@ -992,10 +827,6 @@ def _realtime_worker() -> None:
         line_id, line_text, timestamp, game_id = item
         try:
             service = get_tokenization_service()
-            if service.is_backfill_session_active():
-                _realtime_queue.put(item)
-                time.sleep(0.5)
-                continue
             service.tokenize_lines_batch(
                 [(line_id, line_text, timestamp, game_id)]
             )
@@ -1018,6 +849,32 @@ def _ensure_realtime_worker_started() -> None:
         _realtime_thread.start()
 
 
+def has_pending_realtime_work() -> bool:
+    try:
+        return _realtime_queue.qsize() > 0
+    except Exception:
+        return not _realtime_queue.empty()
+
+
+def _mark_line_pending_with_retry(game_line_id: str) -> None:
+    max_attempts = 5
+    retry_delay_seconds = 0.05
+    max_retry_delay_seconds = 0.5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            GameLinesTable._db.execute(
+                f"UPDATE {GameLinesTable._table} SET tokenized=? WHERE id=?",
+                (TOKENIZED_PENDING, game_line_id),
+                commit=True,
+            )
+            return
+        except Exception as exc:
+            if "database is locked" not in str(exc).lower() or attempt >= max_attempts:
+                raise
+            time.sleep(retry_delay_seconds)
+            retry_delay_seconds = min(retry_delay_seconds * 2, max_retry_delay_seconds)
+
+
 def enqueue_realtime_tokenization(
     game_line_id: str,
     line_text: str,
@@ -1026,10 +883,6 @@ def enqueue_realtime_tokenization(
 ) -> None:
     if not game_line_id:
         return
-    GameLinesTable._db.execute(
-        f"UPDATE {GameLinesTable._table} SET tokenized=? WHERE id=?",
-        (TOKENIZED_PENDING, game_line_id),
-        commit=True,
-    )
+    _mark_line_pending_with_retry(game_line_id)
     _ensure_realtime_worker_started()
     _realtime_queue.put((game_line_id, str(line_text or ""), float(timestamp or time.time()), game_id or ""))
