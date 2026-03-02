@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from datetime import timedelta
 from sys import platform
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Type, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union, Type, TypeVar
 
 from GameSentenceMiner.util.config.configuration import get_config, get_stats_config, logger, is_dev, \
     sanitize_and_resolve_path
@@ -1058,6 +1058,96 @@ class GameLinesTable(SQLiteDBTable):
         count_row = cls._db.fetchone(f"SELECT COUNT(*) FROM {cls._sync_changes_table}")
         return int(count_row[0]) if count_row else 0
 
+    @staticmethod
+    def _recompute_word_frequency_cache_rows(conn: sqlite3.Connection, word_ids: Iterable[int]) -> None:
+        for word_id in {int(x) for x in word_ids if x is not None}:
+            conn.execute(
+                f"""
+                UPDATE {WordsTable._table}
+                SET
+                    frequency=COALESCE((SELECT SUM(COALESCE(count, 1)) FROM {WordOccurrencesTable._table} WHERE word_id=?), 0),
+                    first_seen=COALESCE((SELECT MIN(timestamp) FROM {WordOccurrencesTable._table} WHERE word_id=?), first_seen),
+                    last_seen=COALESCE((SELECT MAX(timestamp) FROM {WordOccurrencesTable._table} WHERE word_id=?), last_seen)
+                WHERE id=?
+                """,
+                (word_id, word_id, word_id, word_id),
+            )
+            conn.execute(
+                f"DELETE FROM {WordsTable._table} WHERE id=? AND COALESCE(frequency, 0) <= 0",
+                (word_id,),
+            )
+
+    @staticmethod
+    def _recompute_kanji_frequency_cache_rows(conn: sqlite3.Connection, kanji_ids: Iterable[int]) -> None:
+        for kanji_id in {int(x) for x in kanji_ids if x is not None}:
+            conn.execute(
+                f"""
+                UPDATE {KanjiTable._table}
+                SET
+                    frequency=COALESCE((SELECT SUM(COALESCE(count, 1)) FROM {KanjiOccurrencesTable._table} WHERE kanji_id=?), 0),
+                    first_seen=COALESCE((SELECT MIN(timestamp) FROM {KanjiOccurrencesTable._table} WHERE kanji_id=?), first_seen),
+                    last_seen=COALESCE((SELECT MAX(timestamp) FROM {KanjiOccurrencesTable._table} WHERE kanji_id=?), last_seen)
+                WHERE id=?
+                """,
+                (kanji_id, kanji_id, kanji_id, kanji_id),
+            )
+            conn.execute(
+                f"DELETE FROM {KanjiTable._table} WHERE id=? AND COALESCE(frequency, 0) <= 0",
+                (kanji_id,),
+            )
+
+    @classmethod
+    def recompute_frequency_cache_rows(
+        cls,
+        conn: sqlite3.Connection,
+        word_ids: Iterable[int],
+        kanji_ids: Iterable[int],
+    ) -> None:
+        cls._recompute_word_frequency_cache_rows(conn, word_ids)
+        cls._recompute_kanji_frequency_cache_rows(conn, kanji_ids)
+
+    @classmethod
+    def _remove_lines_occurrences_in_conn(cls, conn: sqlite3.Connection, line_ids: Sequence[str]) -> None:
+        unique_line_ids = [line_id for line_id in dict.fromkeys(line_ids) if line_id]
+        if not unique_line_ids:
+            return
+
+        placeholders = ", ".join("?" for _ in unique_line_ids)
+        old_word_rows = conn.execute(
+            f"SELECT DISTINCT word_id FROM {WordOccurrencesTable._table} WHERE line_id IN ({placeholders})",
+            tuple(unique_line_ids),
+        ).fetchall()
+        old_kanji_rows = conn.execute(
+            f"SELECT DISTINCT kanji_id FROM {KanjiOccurrencesTable._table} WHERE line_id IN ({placeholders})",
+            tuple(unique_line_ids),
+        ).fetchall()
+
+        conn.execute(
+            f"DELETE FROM {WordOccurrencesTable._table} WHERE line_id IN ({placeholders})",
+            tuple(unique_line_ids),
+        )
+        conn.execute(
+            f"DELETE FROM {KanjiOccurrencesTable._table} WHERE line_id IN ({placeholders})",
+            tuple(unique_line_ids),
+        )
+
+        cls.recompute_frequency_cache_rows(
+            conn,
+            (row[0] for row in old_word_rows),
+            (row[0] for row in old_kanji_rows),
+        )
+
+    @classmethod
+    def remove_lines_occurrences(cls, line_ids: Sequence[str]) -> None:
+        with cls._db.transaction() as conn:
+            cls._remove_lines_occurrences_in_conn(conn, line_ids)
+
+    @classmethod
+    def remove_line_occurrences(cls, line_id: str) -> None:
+        if not line_id:
+            return
+        cls.remove_lines_occurrences([line_id])
+
     @classmethod
     def apply_remote_sync_changes(cls, changes: List[Dict[str, Any]], clear_local_tracking: bool = True) -> Dict[str, int]:
         """
@@ -1081,11 +1171,7 @@ class GameLinesTable(SQLiteDBTable):
                     continue
 
                 if operation == "delete":
-                    cls._db.execute(
-                        f"DELETE FROM {cls._table} WHERE id=?",
-                        (line_id,),
-                        commit=True,
-                    )
+                    cls.delete_line(line_id)
                     if clear_local_tracking:
                         cls._db.execute(
                             f"DELETE FROM {cls._sync_changes_table} WHERE line_id=?",
@@ -1149,12 +1235,13 @@ class GameLinesTable(SQLiteDBTable):
         """
         if not line_id:
             return
-        cls._db.execute(
-            f"DELETE FROM {cls._table} WHERE id=?",
-            (line_id,),
-            commit=True,
-        )
-        
+        with cls._db.transaction() as conn:
+            cls._remove_lines_occurrences_in_conn(conn, [line_id])
+            conn.execute(
+                f"DELETE FROM {cls._table} WHERE id=?",
+                (line_id,),
+            )
+
     @classmethod
     def get_lines_filtered_by_timestamp(cls, start: Optional[float] = None, end: Optional[float] = None, for_stats=False) -> List['GameLinesTable']:
         """

@@ -299,10 +299,11 @@ let jitenReaderSettingsWindow = null;
 let settingsWindow = null;
 let offsetHelperWindow = null;
 let texthookerWindow = null;
-let yomitanApiBridgeWindow = null;
-let yomitanApiBridgeReadyPromise = null;
 let yomitanApiServer = null;
 let yomitanApiAvailabilityState = createYomitanApiAvailabilityState();
+let yomitanApiWarmupTimer = null;
+let yomitanApiWarmupInFlight = false;
+let yomitanApiWarmupAttempts = 0;
 let texthookerLoadToken = 0;
 let tray = null;
 let platformOverride = null;
@@ -683,85 +684,98 @@ function markEmbeddedYomitanApiUnavailable(error) {
   yomitanApiAvailabilityState = buildYomitanApiUnavailableState(yomitanApiAvailabilityState, error);
 }
 
-async function ensureYomitanApiBridgeWindow() {
-  if (yomitanApiBridgeWindow && !yomitanApiBridgeWindow.isDestroyed()) {
-    return yomitanApiBridgeWindow;
+function scheduleEmbeddedYomitanApiWarmup(reason = 'unknown') {
+  if (yomitanApiWarmupTimer || yomitanApiWarmupInFlight) {
+    return;
   }
-  if (yomitanApiBridgeReadyPromise) {
-    return yomitanApiBridgeReadyPromise;
-  }
-
-  yomitanApiBridgeReadyPromise = (async () => {
-    if (!yomitanExt || !yomitanExt.id) {
-      const error = new Error('Yomitan extension is not loaded');
-      markEmbeddedYomitanApiUnavailable(error);
-      throw error;
-    }
-    const bridgeWindow = new BrowserWindow({
-      show: false,
-      width: 800,
-      height: 600,
-      webPreferences: {
-        contextIsolation: false,
-        nodeIntegration: false,
-      },
-    });
-    await bridgeWindow.loadURL(`chrome-extension://${yomitanExt.id}/gsm-api-bridge.html`);
-    await bridgeWindow.webContents.executeJavaScript('document.readyState', true);
-    bridgeWindow.on('closed', () => {
-      if (yomitanApiBridgeWindow === bridgeWindow) {
-        yomitanApiBridgeWindow = null;
+  const maxAttempts = 180;
+  const attempt = async () => {
+    yomitanApiWarmupTimer = null;
+    yomitanApiWarmupInFlight = true;
+    yomitanApiWarmupAttempts += 1;
+    const ready = await probeEmbeddedYomitanApiBridge(1500);
+    yomitanApiWarmupInFlight = false;
+    if (ready) {
+      if (yomitanApiWarmupAttempts > 1) {
+        console.log(`[YomitanAPI] Bridge became ready after ${yomitanApiWarmupAttempts} attempts (reason=${reason}).`);
       }
-      yomitanApiBridgeReadyPromise = null;
-      markEmbeddedYomitanApiUnavailable('Yomitan API bridge window closed');
-    });
-    yomitanApiBridgeWindow = bridgeWindow;
-    markEmbeddedYomitanApiReady();
-    return bridgeWindow;
-  })();
+      yomitanApiWarmupAttempts = 0;
+      return;
+    }
+    if (yomitanApiWarmupAttempts >= maxAttempts) {
+      console.warn(`[YomitanAPI] Bridge warmup gave up after ${yomitanApiWarmupAttempts} attempts (reason=${reason}).`);
+      yomitanApiWarmupAttempts = 0;
+      return;
+    }
+    yomitanApiWarmupTimer = setTimeout(() => {
+      void attempt();
+    }, 1000);
+  };
+  yomitanApiWarmupTimer = setTimeout(() => {
+    void attempt();
+  }, 0);
+}
 
+function createYomitanUnavailableError(error) {
+  const message = String(error && error.message ? error.message : error || 'Yomitan overlay bridge is unavailable');
+  const unavailableError = new Error(message);
+  unavailableError.code = YOMITAN_API_UNAVAILABLE_CODE;
+  return unavailableError;
+}
+
+async function invokeYomitanOverlayBridge(action, body = {}, timeoutMs = 2500) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw createYomitanUnavailableError('Overlay window is not ready');
+  }
+  if (!yomitanExt || !yomitanExt.id) {
+    throw createYomitanUnavailableError('Yomitan extension is not loaded');
+  }
+  const safeTimeout = Math.max(200, Math.min(15000, Number(timeoutMs) || 2500));
+  const payloadBody = (typeof body === 'object' && body !== null) ? body : {};
+  const script = `
+    (async () => {
+      const bridge = window.gsmYomitanBridge;
+      if (!bridge || typeof bridge.invoke !== 'function') {
+        throw new Error('Yomitan overlay bridge is unavailable');
+      }
+      return await bridge.invoke(
+        ${JSON.stringify(action)},
+        ${JSON.stringify(payloadBody)},
+        { timeoutMs: ${safeTimeout} },
+      );
+    })();
+  `;
   try {
-    return await yomitanApiBridgeReadyPromise;
+    return await mainWindow.webContents.executeJavaScript(script, true);
   } catch (error) {
-    yomitanApiBridgeReadyPromise = null;
-    markEmbeddedYomitanApiUnavailable(error);
+    const message = String(error && error.message ? error.message : error || '');
+    const lowered = message.toLowerCase();
+    if (
+      lowered.includes('overlay bridge is unavailable') ||
+      lowered.includes('overlay window is not ready') ||
+      lowered.includes('cannot read properties of null') ||
+      lowered.includes('webcontents')
+    ) {
+      throw createYomitanUnavailableError(message);
+    }
     throw error;
   }
 }
 
-async function invokeYomitanExtensionApi(action, params) {
-  const bridgeWindow = await ensureYomitanApiBridgeWindow();
-  const script = `
-    (async () => {
-      const invoke = (action, params) => new Promise((resolve, reject) => {
-        try {
-          chrome.runtime.sendMessage({ action, params }, (response) => {
-            const runtimeError = chrome.runtime.lastError;
-            if (runtimeError) {
-              reject(new Error(runtimeError.message || String(runtimeError)));
-              return;
-            }
-            if (!response || typeof response !== 'object') {
-              reject(new Error('Unexpected response from extension backend'));
-              return;
-            }
-            if (typeof response.error !== 'undefined') {
-              const errorMessage = (response.error && response.error.message) || JSON.stringify(response.error);
-              reject(new Error(errorMessage || 'Extension API call failed'));
-              return;
-            }
-            resolve(response.result);
-          });
-        } catch (error) {
-          reject(error);
-        }
-      });
-
-      return await invoke(${JSON.stringify(action)}, ${JSON.stringify(params)});
-    })();
-  `;
+async function probeEmbeddedYomitanApiBridge(timeoutMs = 600) {
   try {
-    const result = await bridgeWindow.webContents.executeJavaScript(script, true);
+    await invokeYomitanOverlayBridge('yomitanVersion', {}, timeoutMs);
+    markEmbeddedYomitanApiReady();
+    return true;
+  } catch (error) {
+    markEmbeddedYomitanApiUnavailable(error);
+    return false;
+  }
+}
+
+async function invokeEmbeddedYomitanApi(action, body, timeoutMs = 2500) {
+  try {
+    const result = await invokeYomitanOverlayBridge(action, body, timeoutMs);
     markEmbeddedYomitanApiReady();
     return result;
   } catch (error) {
@@ -778,12 +792,10 @@ async function startEmbeddedYomitanApiServer() {
   if (!yomitanExt || !yomitanExt.id) {
     markEmbeddedYomitanApiUnavailable('Yomitan extension is not loaded');
   } else {
-    try {
-      await ensureYomitanApiBridgeWindow();
-      markEmbeddedYomitanApiReady();
-    } catch (error) {
-      markEmbeddedYomitanApiUnavailable(error);
-      console.warn('[YomitanAPI] Bridge warmup failed; readiness probe will report unavailable:', error);
+    const ready = await probeEmbeddedYomitanApiBridge(1200);
+    if (!ready) {
+      console.warn('[YomitanAPI] Bridge warmup failed; readiness probe will report unavailable.');
+      scheduleEmbeddedYomitanApiWarmup('server-start');
     }
   }
 
@@ -799,15 +811,20 @@ async function startEmbeddedYomitanApiServer() {
       const pathName = urlObj.pathname.replace(/^\/+/, '');
 
       if (pathName === '' || pathName === 'serverVersion') {
+        if (!(yomitanApiAvailabilityState && yomitanApiAvailabilityState.ready)) {
+          await probeEmbeddedYomitanApiBridge(300);
+        }
         const serverVersion = getServerVersionResponse(yomitanApiAvailabilityState, EMBEDDED_YOMITAN_API_VERSION);
         sendJsonResponse(response, serverVersion.statusCode, serverVersion.payload);
         return;
       }
 
+      if (!(yomitanApiAvailabilityState && yomitanApiAvailabilityState.ready)) {
+        await probeEmbeddedYomitanApiBridge(300);
+      }
       ensureYomitanApiAvailable(yomitanApiAvailabilityState);
 
       const body = await readJsonBody(request);
-      const optionsContext = { current: true };
 
       switch (pathName) {
         case 'tokenize': {
@@ -819,33 +836,22 @@ async function startEmbeddedYomitanApiServer() {
           if (!Number.isFinite(scanLength)) {
             throw new Error('Invalid input for tokenize, expected "scanLength" to be a number');
           }
-          const result = await invokeYomitanExtensionApi('parseText', {
+          const result = await invokeEmbeddedYomitanApi('tokenize', {
             text,
-            optionsContext,
             scanLength: Math.max(1, scanLength),
-            useInternalParser: true,
-            useMecabParser: false,
-          });
+          }, 5000);
           sendJsonResponse(response, 200, result);
           return;
         }
         case 'termEntries': {
           const term = typeof body.term === 'string' ? body.term : '';
-          const result = await invokeYomitanExtensionApi('termsFind', {
-            text: term,
-            details: {},
-            optionsContext,
-          });
+          const result = await invokeEmbeddedYomitanApi('termEntries', { term }, 5000);
           sendJsonResponse(response, 200, result);
           return;
         }
         case 'kanjiEntries': {
           const character = typeof body.character === 'string' ? body.character : '';
-          const result = await invokeYomitanExtensionApi('kanjiFind', {
-            text: character,
-            details: {},
-            optionsContext,
-          });
+          const result = await invokeEmbeddedYomitanApi('kanjiEntries', { character }, 5000);
           sendJsonResponse(response, 200, result);
           return;
         }
@@ -2741,11 +2747,12 @@ app.whenReady().then(async () => {
       }
       yomitanApiServer = null;
     }
-    if (yomitanApiBridgeWindow && !yomitanApiBridgeWindow.isDestroyed()) {
-      yomitanApiBridgeWindow.destroy();
-      yomitanApiBridgeWindow = null;
+    if (yomitanApiWarmupTimer) {
+      clearTimeout(yomitanApiWarmupTimer);
+      yomitanApiWarmupTimer = null;
     }
-    yomitanApiBridgeReadyPromise = null;
+    yomitanApiWarmupAttempts = 0;
+    yomitanApiWarmupInFlight = false;
     markEmbeddedYomitanApiUnavailable('App is quitting');
   });
 
@@ -2979,6 +2986,8 @@ app.whenReady().then(async () => {
   loadOverlayPage(mainWindow, 'index.html');
   mainWindow.webContents.on('did-finish-load', () => {
     startOverlayWebSockets();
+    void probeEmbeddedYomitanApiBridge(1200);
+    scheduleEmbeddedYomitanApiWarmup('overlay-did-finish-load');
   });
   if (isDev) {
     mainWindow.webContents.on('context-menu', () => {

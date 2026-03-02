@@ -203,7 +203,6 @@ class TokenizationService:
             1,
             int(os.environ.get("GSM_TOKENIZER_BACKFILL_PRIORITY_PERSIST_CHUNK_SIZE", "16")),
         )
-        self.enabled = os.environ.get("GSM_TOKENIZER_ENABLED", "1") != "0"
         self.backend = str(os.environ.get("GSM_TOKENIZER_BACKEND", "auto")).strip().lower()
         self._backfill_session_active = False
         self._backfill_backend_choice: Optional[str] = None
@@ -275,8 +274,6 @@ class TokenizationService:
             return False
 
     def is_tokenizer_available(self, timeout: float = 0.5, source: str = "realtime") -> bool:
-        if not self.enabled:
-            return False
         backend = self._select_backend(source=source, timeout=timeout)
         if backend == "http":
             return self._is_http_tokenizer_available(timeout)
@@ -382,42 +379,6 @@ class TokenizationService:
                     raise
                 time.sleep(retry_delay_seconds)
                 retry_delay_seconds = min(retry_delay_seconds * 2, max_retry_delay_seconds)
-
-    def _recompute_word_cache_rows(self, conn: Any, word_ids: Iterable[int]) -> None:
-        for word_id in {int(x) for x in word_ids if x is not None}:
-            conn.execute(
-                f"""
-                UPDATE {WordsTable._table}
-                SET
-                    frequency=COALESCE((SELECT SUM(COALESCE(count, 1)) FROM {WordOccurrencesTable._table} WHERE word_id=?), 0),
-                    first_seen=COALESCE((SELECT MIN(timestamp) FROM {WordOccurrencesTable._table} WHERE word_id=?), first_seen),
-                    last_seen=COALESCE((SELECT MAX(timestamp) FROM {WordOccurrencesTable._table} WHERE word_id=?), last_seen)
-                WHERE id=?
-                """,
-                (word_id, word_id, word_id, word_id),
-            )
-            conn.execute(
-                f"DELETE FROM {WordsTable._table} WHERE id=? AND COALESCE(frequency, 0) <= 0",
-                (word_id,),
-            )
-
-    def _recompute_kanji_cache_rows(self, conn: Any, kanji_ids: Iterable[int]) -> None:
-        for kanji_id in {int(x) for x in kanji_ids if x is not None}:
-            conn.execute(
-                f"""
-                UPDATE {KanjiTable._table}
-                SET
-                    frequency=COALESCE((SELECT SUM(COALESCE(count, 1)) FROM {KanjiOccurrencesTable._table} WHERE kanji_id=?), 0),
-                    first_seen=COALESCE((SELECT MIN(timestamp) FROM {KanjiOccurrencesTable._table} WHERE kanji_id=?), first_seen),
-                    last_seen=COALESCE((SELECT MAX(timestamp) FROM {KanjiOccurrencesTable._table} WHERE kanji_id=?), last_seen)
-                WHERE id=?
-                """,
-                (kanji_id, kanji_id, kanji_id, kanji_id),
-            )
-            conn.execute(
-                f"DELETE FROM {KanjiTable._table} WHERE id=? AND COALESCE(frequency, 0) <= 0",
-                (kanji_id,),
-            )
 
     @staticmethod
     def _chunked(seq: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
@@ -577,8 +538,11 @@ class TokenizationService:
                         kanji_insert_rows,
                     )
 
-            self._recompute_word_cache_rows(conn, impacted_word_ids)
-            self._recompute_kanji_cache_rows(conn, impacted_kanji_ids)
+            GameLinesTable.recompute_frequency_cache_rows(
+                conn,
+                impacted_word_ids,
+                impacted_kanji_ids,
+            )
 
             game_line_update_rows: List[Tuple[int, int, int, int, str]] = []
             for line_id, line_text, _timestamp, _game_id, word_counter, kanji_counter in normalized:
@@ -716,31 +680,7 @@ class TokenizationService:
         return (total_processed, total_failed)
 
     def remove_lines_occurrences(self, line_ids: Sequence[str]) -> None:
-        line_ids = [line_id for line_id in dict.fromkeys(line_ids) if line_id]
-        if not line_ids:
-            return
-        placeholders = ", ".join("?" for _ in line_ids)
-        with GameLinesTable._db.transaction() as conn:
-            old_word_rows = conn.execute(
-                f"SELECT DISTINCT word_id FROM {WordOccurrencesTable._table} WHERE line_id IN ({placeholders})",
-                tuple(line_ids),
-            ).fetchall()
-            old_kanji_rows = conn.execute(
-                f"SELECT DISTINCT kanji_id FROM {KanjiOccurrencesTable._table} WHERE line_id IN ({placeholders})",
-                tuple(line_ids),
-            ).fetchall()
-
-            conn.execute(
-                f"DELETE FROM {WordOccurrencesTable._table} WHERE line_id IN ({placeholders})",
-                tuple(line_ids),
-            )
-            conn.execute(
-                f"DELETE FROM {KanjiOccurrencesTable._table} WHERE line_id IN ({placeholders})",
-                tuple(line_ids),
-            )
-
-            self._recompute_word_cache_rows(conn, [row[0] for row in old_word_rows])
-            self._recompute_kanji_cache_rows(conn, [row[0] for row in old_kanji_rows])
+        GameLinesTable.remove_lines_occurrences(line_ids)
 
     def remove_line_occurrences(self, line_id: str) -> None:
         if not line_id:
